@@ -429,6 +429,17 @@ class TestStreamManagerTranscodeFile:
 
         mock_kill.assert_called_once()
 
+    @patch("pikaraoke.lib.stream_manager.Thread")
+    @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
+    def test_transcode_forwards_start_position(self, mock_build_cmd, mock_thread, test_prefs):
+        """Test that a resume position is passed through to build_ffmpeg_cmd."""
+        sm = StreamManager(test_prefs)
+        self._make_mock_ffmpeg(mock_build_cmd, poll_return=0)
+
+        sm._transcode_file(self._make_mock_fr(), semitones=2, is_hls=False, start_position=47.5)
+
+        assert mock_build_cmd.call_args.args[-1] == 47.5
+
 
 class TestStreamManagerPlayFile:
     """Tests for StreamManager.play_file method."""
@@ -558,3 +569,19 @@ class TestStreamManagerPlayFile:
 
         assert result.success is False
         assert result.error is not None
+
+    @patch("flask_babel._", side_effect=lambda x: x)
+    @patch("pikaraoke.lib.stream_manager.is_transcoding_required", return_value=False)
+    @patch("pikaraoke.lib.stream_manager.FileResolver")
+    def test_play_file_duration_reduced_by_start_position(
+        self, mock_resolver_class, mock_transcode_check, mock_gettext, test_prefs
+    ):
+        """Resuming partway through reports what remains, not the source's full length."""
+        sm = StreamManager(test_prefs, streaming_format="hls")
+        self._setup_resolver(mock_resolver_class, output_ext="m3u8", duration=180)
+
+        with patch.object(sm, "_transcode_file", return_value=(True, False)):
+            result = sm.play_file("/songs/test.mp4", start_position=47.5)
+
+        assert result.success is True
+        assert result.duration == 132

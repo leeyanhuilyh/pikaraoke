@@ -378,10 +378,11 @@ class TestResetNowPlayingNotification:
 class TestTransposeCurrent:
     """Tests for transpose_current, which restarts a song in a new key."""
 
-    def _start_playing(self, k, path="/songs/Artist - Song One---abc123.mp4"):
+    def _start_playing(self, k, path="/songs/Artist - Song One---abc123.mp4", position=0):
         k.playback_controller.now_playing = "Artist - Song One"
         k.playback_controller.now_playing_filename = path
         k.playback_controller.now_playing_user = "Alice"
+        k.playback_controller.now_playing_position = position
         k.playback_controller.is_playing = True
         return path
 
@@ -395,6 +396,26 @@ class TestTransposeCurrent:
         assert k.queue_manager.queue[0]["file"] == path
         assert k.queue_manager.queue[0]["semitones"] == 2
         assert k.playback_controller.skipped_reasons == ["transpose"]
+
+    def test_transpose_resumes_at_current_position_instead_of_restarting(
+        self, mock_karaoke_with_songs
+    ):
+        """The requeued song carries the playback position it was transposed at."""
+        k = mock_karaoke_with_songs
+        self._start_playing(k, position=47.5)
+
+        k.transpose_current(2)
+
+        assert k.queue_manager.queue[0]["start_position"] == 47.5
+
+    def test_transpose_with_no_reported_position_starts_from_zero(self, mock_karaoke_with_songs):
+        """Before the client's first position report, fall back to the start."""
+        k = mock_karaoke_with_songs
+        self._start_playing(k, position=None)
+
+        k.transpose_current(2)
+
+        assert k.queue_manager.queue[0]["start_position"] == 0
 
     def test_transpose_keeps_playing_when_the_requeue_is_refused(self, mock_karaoke_with_songs):
         """A refused requeue must not skip: the singer would lose their turn.

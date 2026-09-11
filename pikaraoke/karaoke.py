@@ -534,7 +534,8 @@ class Karaoke:
         return new_path
 
     def transpose_current(self, semitones: int) -> None:
-        """Restart the current song with a new transpose value.
+        """Restart the current song with a new transpose value, resuming from
+        the current playback position rather than the beginning.
 
         Args:
             semitones: Number of semitones to transpose.
@@ -542,14 +543,18 @@ class Karaoke:
         filename = self.playback_controller.now_playing_filename
         user = self.playback_controller.now_playing_user
         now_playing = self.playback_controller.now_playing
+        position = self.playback_controller.now_playing_position or 0
 
         if filename is None or user is None:
             logging.warning("Cannot transpose: no song currently playing")
             return
-        # Insert the same song at the top of the queue with transposition.
+        # Insert the same song at the top of the queue with transposition,
+        # resuming from the current position instead of restarting from 0.
         # The stream ends but the performance does not, so play history keeps
         # the existing play open rather than logging a second one.
-        queued, message = self.queue_manager.enqueue(filename, user, semitones, True)
+        queued, message = self.queue_manager.enqueue(
+            filename, user, semitones, True, start_position=position
+        )
         if not queued:
             # Skipping now would end the song with nothing to restart it: the
             # singer loses their turn, and play history holds the play open
@@ -714,7 +719,7 @@ class Karaoke:
                     if not song:
                         continue
                     result = self.playback_controller.play_file(
-                        song["file"], song["user"], song["semitones"]
+                        song["file"], song["user"], song["semitones"], song["start_position"]
                     )
 
                     # play_file() blocks only until the client connects, so this

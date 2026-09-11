@@ -39,6 +39,7 @@ def build_ffmpeg_cmd(
     buffer_fully_before_playback: bool = False,
     avsync: float = 0,
     cdg_pixel_scaling: bool = False,
+    start_position: float = 0,
 ) -> Any:
     """Build an ffmpeg command for transcoding media.
 
@@ -52,13 +53,17 @@ def build_ffmpeg_cmd(
         force_mp4_encoding: If True, force mp4 encoding.
         avsync: Audio/video sync adjustment in seconds.
         cdg_pixel_scaling: Enable pixel scaling for CDG rendering.
+        start_position: Seek into the source before transcoding, so a
+            re-transcode (e.g. transpose) can resume instead of restarting.
 
     Returns:
         ffmpeg stream object ready to execute with run_async().
     """
     avsync = float(avsync)
+    start_position = float(start_position)
     is_cdg = fr.cdg_file_path is not None
     is_transposed = semitones != 0
+    input_opts: dict[str, Any] = {"ss": start_position} if start_position > 0 else {}
 
     if fr.file_path is None:
         raise ValueError("File path is required to build ffmpeg command")
@@ -89,9 +94,9 @@ def build_ffmpeg_cmd(
 
     # For container formats with VFR or timestamp issues, use genpts
     if fr.file_extension in [".webm", ".avi", ".mov", ".mkv"]:
-        input = ffmpeg.input(fr.file_path, **{"fflags": "+genpts"})
+        input = ffmpeg.input(fr.file_path, **{"fflags": "+genpts", **input_opts})
     else:
-        input = ffmpeg.input(fr.file_path)
+        input = ffmpeg.input(fr.file_path, **input_opts)
     audio = input.audio
 
     # Audio sync adjustment: delay or trim
@@ -111,7 +116,7 @@ def build_ffmpeg_cmd(
     # Video source: CDG input or original video stream
     if is_cdg:
         logging.info("Playing CDG/MP3 file: " + fr.file_path)
-        cdg_input = ffmpeg.input(fr.cdg_file_path, copyts=None)
+        cdg_input = ffmpeg.input(fr.cdg_file_path, copyts=None, **input_opts)
         video = cdg_input.video.filter("fps", fps=25)
         if cdg_pixel_scaling:
             video = video.filter("scale", -1, 720, flags="neighbor")

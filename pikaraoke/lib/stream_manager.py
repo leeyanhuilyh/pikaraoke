@@ -85,7 +85,9 @@ class StreamManager:
         """Prefix relative app paths when PiKaraoke is mounted under a subpath."""
         return f"{self.base_path}{path}" if self.base_path else path
 
-    def play_file(self, file_path: str, semitones: int = 0) -> PlaybackResult:
+    def play_file(
+        self, file_path: str, semitones: int = 0, start_position: float = 0
+    ) -> PlaybackResult:
         """Start playback of a media file.
 
         Handles file resolution, transcoding, and stream setup.
@@ -93,6 +95,8 @@ class StreamManager:
         Args:
             file_path: Path to the media file to play.
             semitones: Number of semitones to transpose (0 = no change).
+            start_position: Seconds into the file to start playback from
+                (e.g. resuming after a transpose instead of restarting).
 
         Returns:
             PlaybackResult with success status and stream information.
@@ -114,6 +118,7 @@ class StreamManager:
             or is_transcoding_required(file_path)
             or avsync != 0
             or is_hls
+            or start_position > 0
         )
 
         logging.debug(f"Requires transcoding: {requires_transcoding}")
@@ -139,7 +144,7 @@ class StreamManager:
             is_buffering_complete = True
         else:
             is_transcoding_complete, is_buffering_complete = self._transcode_file(
-                fr, semitones, is_hls
+                fr, semitones, is_hls, start_position
             )
 
         subtitle_url = None
@@ -150,11 +155,16 @@ class StreamManager:
         # Check if the stream is ready to play
         if is_transcoding_complete or is_buffering_complete:
             logging.debug("Stream ready!")
+            # The transcoded stream itself starts at 0, so the reported
+            # duration is what remains from the seek point, not the source's.
+            duration = fr.duration
+            if duration is not None and start_position > 0:
+                duration = max(round(duration - start_position), 0)
             return PlaybackResult(
                 success=True,
                 stream_url=stream_url_path,
                 subtitle_url=subtitle_url,
-                duration=fr.duration,
+                duration=duration,
             )
         else:
             error_message = _("Failed to prepare stream")
@@ -181,13 +191,16 @@ class StreamManager:
         logging.debug(f"Copying file failed: {dest_path}")
         return False
 
-    def _transcode_file(self, fr: FileResolver, semitones: int, is_hls: bool) -> tuple[bool, bool]:
+    def _transcode_file(
+        self, fr: FileResolver, semitones: int, is_hls: bool, start_position: float = 0
+    ) -> tuple[bool, bool]:
         """Transcode a file using FFmpeg.
 
         Args:
             fr: FileResolver instance with file information.
             semitones: Semitones to transpose.
             is_hls: Whether to use HLS streaming format.
+            start_position: Seconds into the file to start transcoding from.
 
         Returns:
             Tuple of (is_transcoding_complete, is_buffering_complete).
@@ -210,6 +223,7 @@ class StreamManager:
             complete_transcode_before_play,
             avsync,
             cdg_pixel_scaling,
+            start_position,
         )
         self.ffmpeg_process = ffmpeg_cmd.run_async(pipe_stderr=True, pipe_stdin=True)
 

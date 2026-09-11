@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pikaraoke.lib.ffmpeg import (
+    build_ffmpeg_cmd,
     get_ffmpeg_version,
     get_media_duration,
     is_ffmpeg_installed,
@@ -167,3 +168,34 @@ class TestSupportsHardwareH264EncodingIndexError:
         with patch("platform.machine", return_value="aarch64"):
             with patch("subprocess.run", side_effect=IndexError):
                 assert supports_hardware_h264_encoding() is False
+
+
+class TestBuildFfmpegCmdStartPosition:
+    """Tests for the start_position seek offset in build_ffmpeg_cmd."""
+
+    def _make_mock_fr(self):
+        mock_fr = MagicMock()
+        mock_fr.file_path = "/songs/test---abc123.mp4"
+        mock_fr.file_extension = ".mp4"
+        mock_fr.cdg_file_path = None
+        mock_fr.output_file = "/tmp/out.mp4"
+        return mock_fr
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_no_seek_by_default(self, mock_hw):
+        """Test that no -ss is added when start_position is 0."""
+        output = build_ffmpeg_cmd(self._make_mock_fr(), force_mp4_encoding=True)
+
+        args = output.get_args()
+        assert "-ss" not in args
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_seeks_to_start_position(self, mock_hw):
+        """Test that a positive start_position adds a matching -ss input option."""
+        output = build_ffmpeg_cmd(
+            self._make_mock_fr(), force_mp4_encoding=True, start_position=47.5
+        )
+
+        args = output.get_args()
+        assert "-ss" in args
+        assert args[args.index("-ss") + 1] == "47.5"
