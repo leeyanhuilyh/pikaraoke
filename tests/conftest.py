@@ -106,6 +106,7 @@ class MockPlaybackController:
     now_playing_url: str | None = None
     now_playing_subtitle_url: str | None = None
     now_playing_position: float | None = None
+    now_playing_start_offset: float = 0
     is_paused: bool = True
     is_playing: bool = False
 
@@ -140,6 +141,7 @@ class MockPlaybackController:
         self.now_playing_transpose = 0
         self.now_playing_duration = None
         self.now_playing_position = None
+        self.now_playing_start_offset = 0
 
     def get_now_playing(self) -> dict:
         return {

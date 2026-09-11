@@ -86,6 +86,45 @@ class TestStreamManagerLogFfmpegOutput:
         # Should not raise
         sm.log_ffmpeg_output()
 
+    def test_logs_error_once_on_late_unexpected_exit(self, test_prefs):
+        """A crash after playback already started must be surfaced, not silently dropped."""
+        sm = StreamManager(test_prefs)
+        sm.ffmpeg_log = Queue()
+        sm.ffmpeg_log.put(b"some diagnostic output\n")
+        sm.ffmpeg_process = MagicMock()
+        sm.ffmpeg_process.poll.return_value = 1
+
+        with patch("pikaraoke.lib.stream_manager.logging") as mock_logging:
+            sm.log_ffmpeg_output()
+            assert mock_logging.error.call_count == 1
+            assert "1" in mock_logging.error.call_args[0][0]
+
+            # A second call for the same (still-dead) process must not repeat the error.
+            sm.log_ffmpeg_output()
+            assert mock_logging.error.call_count == 1
+
+    def test_no_error_logged_for_clean_exit(self, test_prefs):
+        """A normal exit code 0 (transcode simply finished) is not a crash."""
+        sm = StreamManager(test_prefs)
+        sm.ffmpeg_log = Queue()
+        sm.ffmpeg_process = MagicMock()
+        sm.ffmpeg_process.poll.return_value = 0
+
+        with patch("pikaraoke.lib.stream_manager.logging") as mock_logging:
+            sm.log_ffmpeg_output()
+            mock_logging.error.assert_not_called()
+
+    def test_no_error_logged_while_still_running(self, test_prefs):
+        """poll() returning None means the process hasn't exited at all."""
+        sm = StreamManager(test_prefs)
+        sm.ffmpeg_log = Queue()
+        sm.ffmpeg_process = MagicMock()
+        sm.ffmpeg_process.poll.return_value = None
+
+        with patch("pikaraoke.lib.stream_manager.logging") as mock_logging:
+            sm.log_ffmpeg_output()
+            mock_logging.error.assert_not_called()
+
 
 class TestStreamManagerKillFfmpeg:
     """Tests for StreamManager.kill_ffmpeg method."""

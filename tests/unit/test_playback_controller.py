@@ -141,6 +141,26 @@ class TestPlaybackControllerPlayFile:
         assert result.success is False
         assert result.error == "Stream error"
 
+    @patch("pikaraoke.lib.playback_controller.os.path.isfile", return_value=True)
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    def test_play_file_records_start_offset_and_forwards_it(
+        self, mock_sleep, mock_isfile, test_prefs
+    ):
+        """The resume offset must reach StreamManager and be remembered for later transposes."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: "Test Song"
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc.stream_manager.play_file = MagicMock(
+            return_value=PlaybackResult(success=True, stream_url="/s.m3u8", duration=100)
+        )
+        pc.is_playing = True
+
+        pc.play_file("/songs/test.mp4", "TestUser", semitones=2, start_position=47.5)
+
+        pc.stream_manager.play_file.assert_called_once_with("/songs/test.mp4", 2, 47.5)
+        assert pc.now_playing_start_offset == 47.5
+
 
 class TestPlaybackControllerClaim:
     """The claim is what a rename request consults, so it must outlast no window."""
@@ -384,6 +404,7 @@ class TestPlaybackControllerResetNowPlaying:
         pc = PlaybackController(test_prefs, events, filename_fn)
         pc.now_playing = "Test Song"
         pc.now_playing_user = "TestUser"
+        pc.now_playing_start_offset = 47.5
         pc.is_playing = True
         pc.is_paused = False
 
@@ -393,3 +414,4 @@ class TestPlaybackControllerResetNowPlaying:
         assert pc.now_playing_user is None
         assert pc.is_playing is False
         assert pc.is_paused is True
+        assert pc.now_playing_start_offset == 0

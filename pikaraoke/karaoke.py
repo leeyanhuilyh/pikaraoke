@@ -543,7 +543,12 @@ class Karaoke:
         filename = self.playback_controller.now_playing_filename
         user = self.playback_controller.now_playing_user
         now_playing = self.playback_controller.now_playing
-        position = self.playback_controller.now_playing_position or 0
+        # now_playing_position is relative to the currently playing stream,
+        # which itself may already start partway into the file (e.g. an
+        # earlier transpose), so the two must be added for the true position.
+        position = self.playback_controller.now_playing_start_offset + (
+            self.playback_controller.now_playing_position or 0
+        )
 
         if filename is None or user is None:
             logging.warning("Cannot transpose: no song currently playing")

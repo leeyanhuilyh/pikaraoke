@@ -378,11 +378,14 @@ class TestResetNowPlayingNotification:
 class TestTransposeCurrent:
     """Tests for transpose_current, which restarts a song in a new key."""
 
-    def _start_playing(self, k, path="/songs/Artist - Song One---abc123.mp4", position=0):
+    def _start_playing(
+        self, k, path="/songs/Artist - Song One---abc123.mp4", position=0, start_offset=0
+    ):
         k.playback_controller.now_playing = "Artist - Song One"
         k.playback_controller.now_playing_filename = path
         k.playback_controller.now_playing_user = "Alice"
         k.playback_controller.now_playing_position = position
+        k.playback_controller.now_playing_start_offset = start_offset
         k.playback_controller.is_playing = True
         return path
 
@@ -407,6 +410,24 @@ class TestTransposeCurrent:
         k.transpose_current(2)
 
         assert k.queue_manager.queue[0]["start_position"] == 47.5
+
+    def test_transpose_accumulates_position_across_repeated_transposes(
+        self, mock_karaoke_with_songs
+    ):
+        """A second transpose must add its stream-relative position to the
+        offset the first transpose already applied, not replace it.
+
+        The currently playing stream already starts 47.5s into the file (an
+        earlier transpose), and 12s have elapsed in it since, so the true
+        position in the source file is 59.5s, not the raw 12s reported by
+        the client.
+        """
+        k = mock_karaoke_with_songs
+        self._start_playing(k, position=12, start_offset=47.5)
+
+        k.transpose_current(-1)
+
+        assert k.queue_manager.queue[0]["start_position"] == 59.5
 
     def test_transpose_with_no_reported_position_starts_from_zero(self, mock_karaoke_with_songs):
         """Before the client's first position report, fall back to the start."""

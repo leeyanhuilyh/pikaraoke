@@ -80,6 +80,10 @@ class StreamManager:
         self.ffmpeg_process = None
         self.ffmpeg_log: Queue | None = None
         self.base_path = normalize_url_base_path(base_path)
+        # Which process's unexpected exit has already been logged, so a crash
+        # after playback starts (nothing else polls the process by then) is
+        # reported exactly once instead of silently going unnoticed.
+        self._exit_logged_for: subprocess.Popen | None = None
 
     def _with_base_path(self, path: str) -> str:
         """Prefix relative app paths when PiKaraoke is mounted under a subpath."""
@@ -226,6 +230,7 @@ class StreamManager:
             start_position,
         )
         self.ffmpeg_process = ffmpeg_cmd.run_async(pipe_stderr=True, pipe_stdin=True)
+        self._exit_logged_for = None
 
         # FFmpeg outputs to stderr - prevent blocking reads
         self.ffmpeg_log = Queue()
@@ -353,12 +358,36 @@ class StreamManager:
         return False
 
     def log_ffmpeg_output(self) -> None:
-        """Log any pending FFmpeg output from the queue."""
+        """Log any pending FFmpeg output from the queue, and surface a crash.
+
+        Buffering readiness is only checked once, while starting playback;
+        once the stream is handed to the client nothing else watches the
+        process, so a later crash would otherwise run the clock out on the
+        client's own stall detector with no trace of why in the log.
+        """
         if self.ffmpeg_log is None:
             return
+        recent_lines: list[str] = []
         while self.ffmpeg_log.qsize() > 0:
             output = self.ffmpeg_log.get_nowait()
-            logging.debug("[FFMPEG] " + output.decode("utf-8", "ignore").strip())
+            line = output.decode("utf-8", "ignore").strip()
+            logging.debug("[FFMPEG] " + line)
+            recent_lines.append(line)
+
+        process = self.ffmpeg_process
+        exit_code = process.poll() if process else None
+        if (
+            process is not None
+            and process is not self._exit_logged_for
+            and exit_code
+            not in (
+                None,
+                0,
+            )
+        ):
+            self._exit_logged_for = process
+            tail = "\n".join(recent_lines[-20:])
+            logging.error(f"FFmpeg exited unexpectedly with code {exit_code}:\n{tail}")
 
     def kill_ffmpeg(self) -> None:
         """Terminate the running FFmpeg process gracefully.

@@ -30,7 +30,13 @@ class PlaybackController:
         now_playing_duration: Duration of current song in seconds.
         now_playing_url: Stream URL for current song.
         now_playing_subtitle_url: URL path for subtitles.
-        now_playing_position: Current playback position in seconds.
+        now_playing_position: Current playback position within the playing
+            stream, in seconds (0 at the stream's own start, not the source
+            file's).
+        now_playing_start_offset: Where in the source file the current
+            stream's position 0 corresponds to, e.g. after a transpose seeks
+            forward. Add this to now_playing_position for the true position
+            in the source file.
         is_paused: Whether playback is paused.
         is_playing: Whether a song is currently playing.
         ffmpeg_process: Currently running FFmpeg subprocess.
@@ -44,6 +50,7 @@ class PlaybackController:
     now_playing_url: str | None = None
     now_playing_subtitle_url: str | None = None
     now_playing_position: float | None = None
+    now_playing_start_offset: float = 0
     is_paused: bool = True
     is_playing: bool = False
 
@@ -115,6 +122,7 @@ class PlaybackController:
         self.now_playing_duration = result.duration
         self.now_playing_url = result.stream_url
         self.now_playing_subtitle_url = result.subtitle_url
+        self.now_playing_start_offset = start_position
         self.is_paused = False
 
         self.events.emit("playback_started")
@@ -248,6 +256,7 @@ class PlaybackController:
         self.now_playing_transpose = 0
         self.now_playing_duration = None
         self.now_playing_position = None
+        self.now_playing_start_offset = 0
 
     def log_output(self) -> None:
         """Log any pending FFmpeg output."""
