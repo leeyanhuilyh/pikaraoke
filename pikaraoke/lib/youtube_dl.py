@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -85,7 +86,8 @@ def get_youtube_id_from_url(url: str) -> str | None:
 def upgrade_youtubedl() -> str:
     """Upgrade yt-dlp to the latest version.
 
-    Attempts self-upgrade first, then falls back to pip if needed.
+    Attempts self-upgrade first, then falls back to pip, then to uv (for
+    uv-managed venvs, which don't ship a pip module for pip to fall back on).
 
     Returns:
         The new version string after upgrade.
@@ -110,18 +112,26 @@ def upgrade_youtubedl() -> str:
 
     upgrade_success = False
     if "pip" in output.lower():
-        pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
+        logging.info("yt-dlp is outdated! Attempting upgrade...")
 
+        pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
         # Outside a venv, pip requires --break-system-packages on modern Python
         if sys.prefix == sys.base_prefix:
             pip_cmd.append("--break-system-packages")
 
         try:
-            logging.info(f"yt-dlp is outdated! Attempting upgrade via {pip_cmd}...")
             subprocess.check_output(pip_cmd, stderr=subprocess.STDOUT)
             upgrade_success = True
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logging.error(f"Failed to upgrade yt-dlp using pip: {e}")
+            logging.debug(f"Failed to upgrade yt-dlp using pip: {e}")
+
+        if not upgrade_success and shutil.which("uv"):
+            uv_cmd = ["uv", "pip", "install", "--python", sys.executable, "--upgrade", "yt-dlp"]
+            try:
+                subprocess.check_output(uv_cmd, stderr=subprocess.STDOUT)
+                upgrade_success = True
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to upgrade yt-dlp using uv: {e}")
 
     youtubedl_version = get_youtubedl_version()
     if upgrade_success:
