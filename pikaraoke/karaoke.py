@@ -540,25 +540,75 @@ class Karaoke:
         Args:
             semitones: Number of semitones to transpose.
         """
+        now_playing = self.playback_controller.now_playing
+        # MSG: Message shown after the song is transposed, first is the semitones and then the song name
+        message = _("Transposing by %s semitones: %s") % (semitones, now_playing)
+        self._restart_current_with(
+            semitones,
+            self.playback_controller.now_playing_vocal_reduction,
+            message,
+            reason="transpose",
+        )
+
+    def toggle_vocal_reduction(self) -> None:
+        """Restart the current song with vocal reduction toggled on or off,
+        resuming from the current playback position rather than the
+        beginning.
+        """
+        now_playing = self.playback_controller.now_playing
+        new_value = not self.playback_controller.now_playing_vocal_reduction
+        # MSG: Message shown after vocal reduction is toggled, first is on/off and then the song name
+        message = _("Vocal reduction %s: %s") % (
+            _("on") if new_value else _("off"),
+            now_playing,
+        )
+        self._restart_current_with(
+            self.playback_controller.now_playing_transpose,
+            new_value,
+            message,
+            reason="vocal_reduction",
+        )
+
+    def _restart_current_with(
+        self, semitones: int, vocal_reduction: bool, notify_message: str, reason: str
+    ) -> None:
+        """Restart the current song with new playback settings, resuming
+        from the current playback position rather than the beginning.
+
+        Shared by transpose_current and toggle_vocal_reduction: both requeue
+        the same song in place and resume it, differing only in which
+        setting changes.
+
+        Args:
+            semitones: Number of semitones to transpose.
+            vocal_reduction: Whether to cancel the stereo center channel.
+            notify_message: Message to log and send on success.
+            reason: End reason passed to skip(), so play history can tell a
+                restart like this from a real skip.
+        """
         filename = self.playback_controller.now_playing_filename
         user = self.playback_controller.now_playing_user
-        now_playing = self.playback_controller.now_playing
+
+        if filename is None or user is None:
+            logging.warning("Cannot change playback settings: no song currently playing")
+            return
         # now_playing_position is relative to the currently playing stream,
         # which itself may already start partway into the file (e.g. an
         # earlier transpose), so the two must be added for the true position.
         position = self.playback_controller.now_playing_start_offset + (
             self.playback_controller.now_playing_position or 0
         )
-
-        if filename is None or user is None:
-            logging.warning("Cannot transpose: no song currently playing")
-            return
-        # Insert the same song at the top of the queue with transposition,
+        # Insert the same song at the top of the queue with the new settings,
         # resuming from the current position instead of restarting from 0.
         # The stream ends but the performance does not, so play history keeps
         # the existing play open rather than logging a second one.
         queued, message = self.queue_manager.enqueue(
-            filename, user, semitones, True, start_position=position
+            filename,
+            user,
+            semitones,
+            True,
+            start_position=position,
+            vocal_reduction=vocal_reduction,
         )
         if not queued:
             # Skipping now would end the song with nothing to restart it: the
@@ -566,9 +616,8 @@ class Karaoke:
             # waiting for a restart that is never coming.
             self.log_and_send(str(message), "danger")
             return
-        # MSG: Message shown after the song is transposed, first is the semitones and then the song name
-        self.log_and_send(_("Transposing by %s semitones: %s") % (semitones, now_playing))
-        self.playback_controller.skip(log_action=False, reason="transpose")
+        self.log_and_send(notify_message)
+        self.playback_controller.skip(log_action=False, reason=reason)
 
     def volume_change(self, vol_level: float) -> bool:
         """Set the volume level.
@@ -724,7 +773,11 @@ class Karaoke:
                     if not song:
                         continue
                     result = self.playback_controller.play_file(
-                        song["file"], song["user"], song["semitones"], song["start_position"]
+                        song["file"],
+                        song["user"],
+                        song["semitones"],
+                        song["start_position"],
+                        song["vocal_reduction"],
                     )
 
                     # play_file() blocks only until the client connects, so this

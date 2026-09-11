@@ -477,7 +477,18 @@ class TestStreamManagerTranscodeFile:
 
         sm._transcode_file(self._make_mock_fr(), semitones=2, is_hls=False, start_position=47.5)
 
-        assert mock_build_cmd.call_args.args[-1] == 47.5
+        assert mock_build_cmd.call_args.args[-2] == 47.5
+
+    @patch("pikaraoke.lib.stream_manager.Thread")
+    @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
+    def test_transcode_forwards_vocal_reduction(self, mock_build_cmd, mock_thread, test_prefs):
+        """Test that vocal reduction is passed through to build_ffmpeg_cmd."""
+        sm = StreamManager(test_prefs)
+        self._make_mock_ffmpeg(mock_build_cmd, poll_return=0)
+
+        sm._transcode_file(self._make_mock_fr(), semitones=0, is_hls=False, vocal_reduction=True)
+
+        assert mock_build_cmd.call_args.args[-1] is True
 
 
 class TestStreamManagerPlayFile:

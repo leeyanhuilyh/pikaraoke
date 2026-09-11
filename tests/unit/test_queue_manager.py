@@ -562,6 +562,7 @@ class TestQueueManagerUpdateSongPath:
             "title": "new",
             "semitones": 2,
             "start_position": 0,
+            "vocal_reduction": False,
         }
 
     def test_a_song_that_is_not_queued_changes_nothing(self, queue_manager):

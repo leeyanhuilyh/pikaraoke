@@ -40,6 +40,7 @@ def build_ffmpeg_cmd(
     avsync: float = 0,
     cdg_pixel_scaling: bool = False,
     start_position: float = 0,
+    vocal_reduction: bool = False,
 ) -> Any:
     """Build an ffmpeg command for transcoding media.
 
@@ -55,6 +56,10 @@ def build_ffmpeg_cmd(
         cdg_pixel_scaling: Enable pixel scaling for CDG rendering.
         start_position: Seek into the source before transcoding, so a
             re-transcode (e.g. transpose) can resume instead of restarting.
+        vocal_reduction: Cancel the stereo center channel to attenuate
+            vocals mixed there. Cheap and imperfect: it also cancels any
+            other centered content (bass, kick, snare) and does nothing for
+            vocals that aren't centered in the mix.
 
     Returns:
         ffmpeg stream object ready to execute with run_async().
@@ -90,7 +95,11 @@ def build_ffmpeg_cmd(
 
     # Copy audio if no processing needed, otherwise re-encode with AAC
     # CDG always re-encodes audio for compatibility
-    acodec = "aac" if is_cdg or is_transposed or normalize_audio or avsync != 0 else "copy"
+    acodec = (
+        "aac"
+        if is_cdg or is_transposed or normalize_audio or avsync != 0 or vocal_reduction
+        else "copy"
+    )
 
     # For container formats with VFR or timestamp issues, use genpts
     if fr.file_extension in [".webm", ".avi", ".mov", ".mkv"]:
@@ -104,6 +113,13 @@ def build_ffmpeg_cmd(
         audio = audio.filter("adelay", f"{avsync * 1000}|{avsync * 1000}")
     elif avsync < 0:
         audio = audio.filter("atrim", start=-avsync)
+
+    # Vocal reduction: cancel whatever is mixed dead-center (often vocals) by
+    # subtracting each channel from the other (stereotools mode 10 = lr>l-r).
+    # Imprecise phase-cancellation, not true source separation - see the
+    # vocal_reduction docstring above.
+    if vocal_reduction:
+        audio = audio.filter("stereotools", mode=10)
 
     # Pitch shifting: 2^(semitones/12)
     if is_transposed:

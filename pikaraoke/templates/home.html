@@ -28,6 +28,14 @@
 					"<span>";
 			}
 
+			if (np.now_playing_vocal_reduction) {
+				nowPlayingHtml +=
+					// {# MSG: Label shown when vocal reduction is active on the playing song. #}
+					" <span class='is-size-6 has-text-success'>" +
+					{{ _("Vocal reduction on") | tojson }} +
+					"<span>";
+			}
+
 			$("#now-playing").html(nowPlayingHtml);
 			$(".control-box").show();
 		} else {
@@ -53,6 +61,8 @@
 			$("#transpose").val(0);
 			$("#semitones-label").html(getSemitonesLabel(np.now_playing_transpose));
 		}
+
+		$("#vocal-reduction-toggle").prop("checked", !!np.now_playing_vocal_reduction);
 
 		// set the volume slider to the current volume
 		if (np.volume != volume) {
@@ -141,6 +151,18 @@
 		$("#semitones-info").click(function () {
 			showNotification(
 				window.translations.semitonesInfo,
+				"is-info",
+				10000
+			);
+		});
+
+		$("#vocal-reduction-toggle").change(function () {
+			$.post(window.pikaraokeConfig.basePath + "/vocal_reduction/toggle");
+		});
+
+		$("#vocal-reduction-info").click(function () {
+			showNotification(
+				window.translations.vocalReductionInfo,
 				"is-info",
 				10000
 			);
@@ -306,6 +328,20 @@
 		</div>
 	</div>
 	{% endif %}
+
+	<hr />
+	<div class="is-flex" style="justify-content: space-between">
+		<div>
+			{# MSG: Title of a control to attenuate vocals in the playing song. #}
+			<h4>{% trans %}Vocal Reduction{% endtrans %}</h4>
+		</div>
+		<div class="is-flex">
+			<label class="checkbox">
+				<input type="checkbox" id="vocal-reduction-toggle" />
+			</label>
+			<a id="vocal-reduction-info"> <i class="icon icon-info-circled-1" title="Info"></i></a>
+		</div>
+	</div>
 
 	{% if mic_available %}
 	<div id="mic-live-panel" style="display: none">

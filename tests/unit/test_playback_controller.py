@@ -158,7 +158,7 @@ class TestPlaybackControllerPlayFile:
 
         pc.play_file("/songs/test.mp4", "TestUser", semitones=2, start_position=47.5)
 
-        pc.stream_manager.play_file.assert_called_once_with("/songs/test.mp4", 2, 47.5)
+        pc.stream_manager.play_file.assert_called_once_with("/songs/test.mp4", 2, 47.5, False)
         assert pc.now_playing_start_offset == 47.5
 
 

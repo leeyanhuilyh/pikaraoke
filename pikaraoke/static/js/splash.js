@@ -13,6 +13,10 @@ const bgMediaResumeDelay = 2000;
 let isScoreShown = false;
 const hasBgVideo = PikaraokeConfig.hasBgVideo;
 let currentVideoUrl = null;
+// Bumped on every new video load so a stale timer from a superseded load
+// (e.g. two restarts in quick succession from repeated transpose/vocal
+// reduction toggles) can tell it no longer applies and skip its action.
+let videoLoadGeneration = 0;
 let hlsInstance = null;
 let idleTime = 0;
 let screensaverTimeoutSeconds = PikaraokeConfig.screensaverTimeout;
@@ -335,6 +339,7 @@ const handleNowPlayingUpdate = (np) => {
 
   if (np.now_playing_url && np.now_playing_url !== currentVideoUrl) {
     currentVideoUrl = np.now_playing_url;
+    const thisLoadGeneration = ++videoLoadGeneration;
     const streamUrl = np.now_playing_url;
     $("#video-source").attr("src", "");
     video.load();
@@ -382,6 +387,8 @@ const handleNowPlayingUpdate = (np) => {
     }
 
     setTimeout(() => {
+      // A newer load has since superseded this one - its own timer covers it.
+      if (videoLoadGeneration !== thisLoadGeneration) return;
       if (!isMediaPlaying(video) && !video.paused) {
         endSong("failed to start");
       }
@@ -454,7 +461,12 @@ const setupVideoPlayer = () => {
   video.addEventListener("play", () => {
     $("#video-container").show();
     if (isMaster) {
-      setTimeout(() => { socket.emit("start_song") }, 1200);
+      const thisLoadGeneration = videoLoadGeneration;
+      setTimeout(() => {
+        // A newer load has since superseded this one - let its own play event report instead.
+        if (videoLoadGeneration !== thisLoadGeneration) return;
+        socket.emit("start_song");
+      }, 1200);
     }
   });
 

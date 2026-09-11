@@ -27,6 +27,8 @@ class PlaybackController:
         now_playing_filename: File path of the currently playing song.
         now_playing_user: User who queued the current song.
         now_playing_transpose: Semitones to transpose current song.
+        now_playing_vocal_reduction: Whether vocal reduction is applied to
+            the current song.
         now_playing_duration: Duration of current song in seconds.
         now_playing_url: Stream URL for current song.
         now_playing_subtitle_url: URL path for subtitles.
@@ -46,6 +48,7 @@ class PlaybackController:
     now_playing_filename: str | None = None
     now_playing_user: str | None = None
     now_playing_transpose: int = 0
+    now_playing_vocal_reduction: bool = False
     now_playing_duration: int | None = None
     now_playing_url: str | None = None
     now_playing_subtitle_url: str | None = None
@@ -82,7 +85,12 @@ class PlaybackController:
         return self.stream_manager.ffmpeg_process
 
     def play_file(
-        self, file_path: str, user: str, semitones: int = 0, start_position: float = 0
+        self,
+        file_path: str,
+        user: str,
+        semitones: int = 0,
+        start_position: float = 0,
+        vocal_reduction: bool = False,
     ) -> PlaybackResult:
         """Start playback of a media file.
 
@@ -94,6 +102,8 @@ class PlaybackController:
             semitones: Number of semitones to transpose (0 = no change).
             start_position: Seconds into the file to start playback from
                 (e.g. resuming after a transpose instead of restarting).
+            vocal_reduction: Cancel the stereo center channel to attenuate
+                vocals mixed there.
 
         Returns:
             PlaybackResult with success status and stream information.
@@ -110,7 +120,9 @@ class PlaybackController:
 
         self.claim(file_path)
 
-        result = self.stream_manager.play_file(file_path, semitones, start_position)
+        result = self.stream_manager.play_file(
+            file_path, semitones, start_position, vocal_reduction
+        )
 
         if not result.success:
             self.now_playing_filename = None
@@ -119,6 +131,7 @@ class PlaybackController:
         self.now_playing = self.filename_from_path(file_path, remove_youtube_id=True)
         self.now_playing_user = user
         self.now_playing_transpose = semitones
+        self.now_playing_vocal_reduction = vocal_reduction
         self.now_playing_duration = result.duration
         self.now_playing_url = result.stream_url
         self.now_playing_subtitle_url = result.subtitle_url
@@ -170,7 +183,7 @@ class PlaybackController:
         logging.info(f"Song ending: {self.now_playing}")
         if reason:
             logging.info(f"Reason: {reason}")
-            if reason not in ("complete", "skip", "transpose"):
+            if reason not in ("complete", "skip", "transpose", "vocal_reduction"):
                 # MSG: Message shown when the song ends abnormally
                 self.events.emit("notification", _("Song ended abnormally: %s") % reason, "danger")
 
@@ -238,6 +251,7 @@ class PlaybackController:
             "now_playing_user": self.now_playing_user,
             "now_playing_duration": self.now_playing_duration,
             "now_playing_transpose": self.now_playing_transpose,
+            "now_playing_vocal_reduction": self.now_playing_vocal_reduction,
             "now_playing_url": self.now_playing_url,
             "now_playing_subtitle_url": self.now_playing_subtitle_url,
             "now_playing_position": self.now_playing_position,
@@ -254,6 +268,7 @@ class PlaybackController:
         self.is_paused = True
         self.is_playing = False
         self.now_playing_transpose = 0
+        self.now_playing_vocal_reduction = False
         self.now_playing_duration = None
         self.now_playing_position = None
         self.now_playing_start_offset = 0

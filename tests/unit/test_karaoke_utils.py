@@ -459,6 +459,73 @@ class TestTransposeCurrent:
 
         assert mock_karaoke_with_songs.playback_controller.skipped_reasons == []
 
+    def test_transpose_preserves_the_current_vocal_reduction_setting(self, mock_karaoke_with_songs):
+        """Changing key must not silently turn off an active vocal reduction toggle."""
+        k = mock_karaoke_with_songs
+        self._start_playing(k)
+        k.playback_controller.now_playing_vocal_reduction = True
+
+        k.transpose_current(2)
+
+        assert k.queue_manager.queue[0]["vocal_reduction"] is True
+
+
+class TestToggleVocalReduction:
+    """Tests for toggle_vocal_reduction, which restarts a song with vocal reduction flipped."""
+
+    def _start_playing(
+        self, k, path="/songs/Artist - Song One---abc123.mp4", position=0, start_offset=0
+    ):
+        k.playback_controller.now_playing = "Artist - Song One"
+        k.playback_controller.now_playing_filename = path
+        k.playback_controller.now_playing_user = "Alice"
+        k.playback_controller.now_playing_position = position
+        k.playback_controller.now_playing_start_offset = start_offset
+        k.playback_controller.is_playing = True
+        return path
+
+    def test_toggle_turns_on_and_requeues_with_its_own_reason(self, mock_karaoke_with_songs):
+        k = mock_karaoke_with_songs
+        path = self._start_playing(k)
+
+        k.toggle_vocal_reduction()
+
+        assert k.queue_manager.queue[0]["file"] == path
+        assert k.queue_manager.queue[0]["vocal_reduction"] is True
+        assert k.playback_controller.skipped_reasons == ["vocal_reduction"]
+
+    def test_toggle_turns_off_when_already_on(self, mock_karaoke_with_songs):
+        k = mock_karaoke_with_songs
+        self._start_playing(k)
+        k.playback_controller.now_playing_vocal_reduction = True
+
+        k.toggle_vocal_reduction()
+
+        assert k.queue_manager.queue[0]["vocal_reduction"] is False
+
+    def test_toggle_preserves_the_current_transpose(self, mock_karaoke_with_songs):
+        """Toggling vocal reduction must not silently reset an active key change."""
+        k = mock_karaoke_with_songs
+        self._start_playing(k)
+        k.playback_controller.now_playing_transpose = 3
+
+        k.toggle_vocal_reduction()
+
+        assert k.queue_manager.queue[0]["semitones"] == 3
+
+    def test_toggle_resumes_at_current_position(self, mock_karaoke_with_songs):
+        k = mock_karaoke_with_songs
+        self._start_playing(k, position=12, start_offset=47.5)
+
+        k.toggle_vocal_reduction()
+
+        assert k.queue_manager.queue[0]["start_position"] == 59.5
+
+    def test_toggle_with_nothing_playing_does_nothing(self, mock_karaoke_with_songs):
+        mock_karaoke_with_songs.toggle_vocal_reduction()
+
+        assert mock_karaoke_with_songs.playback_controller.skipped_reasons == []
+
 
 class TestRegisterDownloadedSong:
     """Tests for the register_downloaded_song method."""

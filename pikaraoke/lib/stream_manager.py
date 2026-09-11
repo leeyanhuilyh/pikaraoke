@@ -90,7 +90,11 @@ class StreamManager:
         return f"{self.base_path}{path}" if self.base_path else path
 
     def play_file(
-        self, file_path: str, semitones: int = 0, start_position: float = 0
+        self,
+        file_path: str,
+        semitones: int = 0,
+        start_position: float = 0,
+        vocal_reduction: bool = False,
     ) -> PlaybackResult:
         """Start playback of a media file.
 
@@ -101,6 +105,8 @@ class StreamManager:
             semitones: Number of semitones to transpose (0 = no change).
             start_position: Seconds into the file to start playback from
                 (e.g. resuming after a transpose instead of restarting).
+            vocal_reduction: Cancel the stereo center channel to attenuate
+                vocals mixed there.
 
         Returns:
             PlaybackResult with success status and stream information.
@@ -123,6 +129,7 @@ class StreamManager:
             or avsync != 0
             or is_hls
             or start_position > 0
+            or vocal_reduction
         )
 
         logging.debug(f"Requires transcoding: {requires_transcoding}")
@@ -148,7 +155,7 @@ class StreamManager:
             is_buffering_complete = True
         else:
             is_transcoding_complete, is_buffering_complete = self._transcode_file(
-                fr, semitones, is_hls, start_position
+                fr, semitones, is_hls, start_position, vocal_reduction
             )
 
         subtitle_url = None
@@ -196,7 +203,12 @@ class StreamManager:
         return False
 
     def _transcode_file(
-        self, fr: FileResolver, semitones: int, is_hls: bool, start_position: float = 0
+        self,
+        fr: FileResolver,
+        semitones: int,
+        is_hls: bool,
+        start_position: float = 0,
+        vocal_reduction: bool = False,
     ) -> tuple[bool, bool]:
         """Transcode a file using FFmpeg.
 
@@ -205,6 +217,8 @@ class StreamManager:
             semitones: Semitones to transpose.
             is_hls: Whether to use HLS streaming format.
             start_position: Seconds into the file to start transcoding from.
+            vocal_reduction: Cancel the stereo center channel to attenuate
+                vocals mixed there.
 
         Returns:
             Tuple of (is_transcoding_complete, is_buffering_complete).
@@ -228,6 +242,7 @@ class StreamManager:
             avsync,
             cdg_pixel_scaling,
             start_position,
+            vocal_reduction,
         )
         self.ffmpeg_process = ffmpeg_cmd.run_async(pipe_stderr=True, pipe_stdin=True)
         self._exit_logged_for = None

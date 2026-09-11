@@ -199,3 +199,46 @@ class TestBuildFfmpegCmdStartPosition:
         args = output.get_args()
         assert "-ss" in args
         assert args[args.index("-ss") + 1] == "47.5"
+
+
+class TestBuildFfmpegCmdVocalReduction:
+    """Tests for the vocal_reduction center-channel-cancellation filter."""
+
+    def _make_mock_fr(self):
+        mock_fr = MagicMock()
+        mock_fr.file_path = "/songs/test---abc123.mp4"
+        mock_fr.file_extension = ".mp4"
+        mock_fr.cdg_file_path = None
+        mock_fr.output_file = "/tmp/out.mp4"
+        return mock_fr
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_no_filter_by_default(self, mock_hw):
+        """Test that no stereotools filter is added when vocal_reduction is False."""
+        output = build_ffmpeg_cmd(self._make_mock_fr(), force_mp4_encoding=True)
+
+        args = " ".join(output.get_args())
+        assert "stereotools" not in args
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_adds_stereotools_filter_when_enabled(self, mock_hw):
+        """Test that vocal_reduction adds the center-channel-cancellation filter."""
+        output = build_ffmpeg_cmd(
+            self._make_mock_fr(), force_mp4_encoding=True, vocal_reduction=True
+        )
+
+        args = " ".join(output.get_args())
+        assert "stereotools=mode=10" in args
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_forces_audio_reencode_when_enabled(self, mock_hw):
+        """Test that vocal_reduction forces an AAC re-encode instead of a stream copy."""
+        output = build_ffmpeg_cmd(
+            self._make_mock_fr(),
+            force_mp4_encoding=True,
+            normalize_audio=False,
+            vocal_reduction=True,
+        )
+
+        args = output.get_args()
+        assert args[args.index("-acodec") + 1] == "aac"

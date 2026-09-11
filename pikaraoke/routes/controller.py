@@ -42,6 +42,15 @@ def transpose(semitones):
     return redirect(url_for("home.home"))
 
 
+@controller_bp.route("/vocal_reduction/toggle", methods=["POST"])
+def vocal_reduction_toggle():
+    """Toggle vocal reduction on the current song."""
+    k = get_karaoke_instance()
+    broadcast_event("skip", "vocal reduction toggle")
+    k.toggle_vocal_reduction()
+    return redirect(url_for("home.home"))
+
+
 @controller_bp.route("/restart", methods=["POST"])
 def restart():
     """Restart the current song from the beginning."""
