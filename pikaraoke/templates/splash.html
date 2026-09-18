@@ -109,6 +109,9 @@
   <video id="video" poster="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=" disableRemotePlayback playsinline webkit-playsinline style="width: 100%; height: 100%; object-fit: contain;">
     <source id="video-source" src="" />
   </video>
+  {# Holds the last frame from before a stream swap (e.g. a pitch change),
+     so the reload/rebuffer gap reads as a brief hold instead of a black cut. #}
+  <canvas id="video-freeze-frame"></canvas>
 </div>
 
 <div id="bg-video-container" class="video-container">
@@ -259,6 +262,16 @@
     background-color: black;
     display: flex;
     align-items: center;
+  }
+  #video-freeze-frame {
+    display: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    z-index: 1;
   }
   #bg-video-container {
     z-index: 0;

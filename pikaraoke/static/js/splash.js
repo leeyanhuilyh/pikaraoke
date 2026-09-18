@@ -43,6 +43,47 @@ const isMediaPlaying = (media) =>
     media.readyState > 2
   );
 
+// Holds the last frame on screen while a stream swap (e.g. a pitch change
+// restart) reloads the player, so the gap reads as a brief hold instead of
+// a cut to black. Also marks the swap as in-flight for the same window, so
+// the position-reporting interval below can suppress reports of the old
+// stream's position - otherwise a stale report can land after the server
+// resets now_playing_position and make the new stream seek past whatever
+// it's generated so far (hls.js then 404s fetching a segment that doesn't
+// exist yet, and playback never starts).
+let frozenFrameTimeout = null;
+let swapInFlight = false;
+
+const getFreezeFrameCanvas = () => $("#video-freeze-frame")[0];
+
+const unfreezeVideoFrame = () => {
+  clearTimeout(frozenFrameTimeout);
+  frozenFrameTimeout = null;
+  swapInFlight = false;
+  const canvas = getFreezeFrameCanvas();
+  if (canvas) canvas.style.display = "none";
+};
+
+const freezeVideoFrame = (video) => {
+  swapInFlight = true;
+  // Safety net: don't leave reporting suppressed or the frame frozen forever
+  // if the new stream never starts.
+  clearTimeout(frozenFrameTimeout);
+  frozenFrameTimeout = setTimeout(unfreezeVideoFrame, playbackStartTimeout);
+
+  const canvas = getFreezeFrameCanvas();
+  if (!canvas || !video.videoWidth || !video.videoHeight) return;
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  try {
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+  } catch (e) {
+    return;
+  }
+  canvas.style.display = "block";
+  video.addEventListener("playing", unfreezeVideoFrame, { once: true });
+};
+
 const formatTime = (seconds) => {
   if (isNaN(seconds)) {
     return "00:00";
@@ -303,10 +344,16 @@ const handleNowPlayingUpdate = (np) => {
 
   const video = getVideoPlayer();
 
-  // Setup ASS subtitle file if found
+  // Setup ASS subtitle file if found. A broken subtitle worker must not be
+  // able to abort the rest of this function - the video swap and its
+  // watchdog timer below are unrelated and still have to run regardless.
   const subtitleUrl = np.now_playing_subtitle_url;
   if (octopusInstance) {
-    octopusInstance.dispose();
+    try {
+      octopusInstance.dispose();
+    } catch (e) {
+      console.error(e);
+    }
     octopusInstance = null;
   }
   if (subtitleUrl && video) {
@@ -334,6 +381,10 @@ const handleNowPlayingUpdate = (np) => {
   }
 
   if (np.now_playing_url && np.now_playing_url !== currentVideoUrl) {
+    // Only a genuine swap (not the very first load) has a real frame worth holding onto.
+    if (currentVideoUrl && video.readyState >= 2) {
+      freezeVideoFrame(video);
+    }
     currentVideoUrl = np.now_playing_url;
     const streamUrl = np.now_playing_url;
     $("#video-source").attr("src", "");
@@ -374,7 +425,12 @@ const handleNowPlayingUpdate = (np) => {
       setTimeout(() => video.play(), 1000);
     });
 
-    if (np.now_playing_position && isMediaPlaying(video)) {
+    // A stream that was JUST swapped in always starts its own timeline near
+    // 0 - np.now_playing_position (meant for catching an already-running
+    // stream up, e.g. a slave screen reconnecting) can still be carrying a
+    // stale value from the outgoing stream at this exact instant. Seeking to
+    // it here would jump the new stream past what it's generated so far.
+    if (!swapInFlight && np.now_playing_position && isMediaPlaying(video)) {
       if (Math.abs(video.currentTime - np.now_playing_position) > 2) {
         console.log("Syncing to server position:", np.now_playing_position);
         video.currentTime = np.now_playing_position;
@@ -383,6 +439,7 @@ const handleNowPlayingUpdate = (np) => {
 
     setTimeout(() => {
       if (!isMediaPlaying(video) && !video.paused) {
+        unfreezeVideoFrame();
         endSong("failed to start");
       }
     }, playbackStartTimeout);
@@ -458,9 +515,12 @@ const setupVideoPlayer = () => {
     }
   });
 
-  // Master reports playback position to server
+  // Master reports playback position to server. Suppressed mid-swap so a
+  // stale report from the outgoing stream can't overwrite the server's
+  // freshly-reset position and make the new stream seek past what it's
+  // generated so far.
   setInterval(() => {
-    if (isMaster && isMediaPlaying(video)) {
+    if (isMaster && !swapInFlight && isMediaPlaying(video)) {
       socket.emit("playback_position", video.currentTime);
     }
   }, 1000);
@@ -611,16 +671,24 @@ const setupSocketEvents = () => {
   });
   socket.on('skip', (reason) => {
     const video = getVideoPlayer();
+    // A transpose restart is a swap, not an end: freeze the current frame in
+    // place instead of hiding the container, so the reload doesn't cut to
+    // black underneath it. handleNowPlayingUpdate() clears the freeze once
+    // the new stream is actually playing.
+    const isTranspose = reason === "transpose current";
+    if (isTranspose) {
+      freezeVideoFrame(video);
+    }
     const currVolume = video.volume;
     if (isMediaPlaying(video)) {
       $(video).animate({ volume: 0 }, 1000, () => {
         video.pause();
         video.volume = currVolume;
-        hideVideo();
+        if (!isTranspose) hideVideo();
       });
     } else {
       video.pause();
-      hideVideo();
+      if (!isTranspose) hideVideo();
     }
   });
   socket.on('volume', (val) => {
