@@ -103,12 +103,6 @@ class TestQueueManagerEnqueue:
         assert queue_manager.queue[0]["file"] == "/songs/song2---def.mp4"
         assert queue_manager.queue[1]["file"] == "/songs/song1---abc.mp4"
 
-    def test_enqueue_with_semitones(self, queue_manager):
-        """Enqueuing should store the semitones value."""
-        queue_manager.enqueue("/songs/test---abc.mp4", "User1", semitones=3)
-
-        assert queue_manager.queue[0]["semitones"] == 3
-
     def test_enqueue_emits_queue_update(self, queue_manager):
         """Enqueuing should emit queue_update event."""
         captured = []
@@ -464,14 +458,13 @@ class TestQueueManagerPopNext:
 
     def test_pop_next_preserves_song_data(self, queue_manager):
         """Popping next should preserve all song data."""
-        queue_manager.enqueue("/songs/test---abc.mp4", "TestUser", semitones=5)
+        queue_manager.enqueue("/songs/test---abc.mp4", "TestUser")
 
         song = queue_manager.pop_next()
 
         assert song is not None
         assert song["file"] == "/songs/test---abc.mp4"
         assert song["user"] == "TestUser"
-        assert song["semitones"] == 5
         assert song["title"] == "test"
 
 
@@ -552,7 +545,7 @@ class TestQueueManagerUpdateSongPath:
     """Test carrying a queue entry over to a renamed file."""
 
     def test_rewrites_file_and_title_in_place(self, queue_manager):
-        queue_manager.enqueue("/songs/old---abc.mp4", "User1", semitones=2)
+        queue_manager.enqueue("/songs/old---abc.mp4", "User1")
 
         assert queue_manager.update_song_path("/songs/old---abc.mp4", "/songs/new---abc.mp4", "new")
 
@@ -560,7 +553,6 @@ class TestQueueManagerUpdateSongPath:
             "user": "User1",
             "file": "/songs/new---abc.mp4",
             "title": "new",
-            "semitones": 2,
         }
 
     def test_a_song_that_is_not_queued_changes_nothing(self, queue_manager):

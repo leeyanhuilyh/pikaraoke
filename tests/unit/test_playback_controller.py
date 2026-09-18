@@ -88,13 +88,13 @@ class TestPlaybackControllerPlayFile:
         # Simulate client connecting
         pc.is_playing = True
 
-        result = pc.play_file("/songs/test.mp4", "TestUser", semitones=2)
+        result = pc.play_file("/songs/test.mp4", "TestUser")
 
         assert result.success is True
         assert pc.now_playing == "Test Song"
         assert pc.now_playing_filename == "/songs/test.mp4"
         assert pc.now_playing_user == "TestUser"
-        assert pc.now_playing_transpose == 2
+        assert pc.now_playing_transpose == 0
         assert pc.now_playing_duration == 180
         assert pc.is_paused is False
 
@@ -119,7 +119,7 @@ class TestPlaybackControllerPlayFile:
         pc.stream_manager.kill_ffmpeg = MagicMock()
 
         # Client never connects (is_playing stays False)
-        result = pc.play_file("/songs/test.mp4", "TestUser", semitones=0)
+        result = pc.play_file("/songs/test.mp4", "TestUser")
 
         assert result.success is False
         assert result.error is not None
@@ -140,6 +140,24 @@ class TestPlaybackControllerPlayFile:
 
         assert result.success is False
         assert result.error == "Stream error"
+
+    @patch("pikaraoke.lib.playback_controller.os.path.isfile", return_value=True)
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    def test_play_file_starts_untransposed(self, mock_sleep, mock_isfile, test_prefs):
+        """A freshly started song always begins at its original pitch."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: "Test Song"
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc.stream_manager.play_file = MagicMock(
+            return_value=PlaybackResult(success=True, stream_url="/s.m3u8", duration=100)
+        )
+        pc.is_playing = True
+
+        pc.play_file("/songs/test.mp4", "TestUser")
+
+        pc.stream_manager.play_file.assert_called_once_with("/songs/test.mp4")
+        assert pc.now_playing_transpose == 0
 
 
 class TestPlaybackControllerClaim:
@@ -351,6 +369,51 @@ class TestPlaybackControllerPause:
         assert result is False
 
 
+class TestPlaybackControllerSetPitch:
+    """Tests for PlaybackController.set_pitch, the live pitch-change command."""
+
+    def test_set_pitch_when_playing(self, test_prefs):
+        """A successful live change updates the reported transpose."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc.is_playing = True
+        pc.stream_manager.set_pitch = MagicMock(return_value=True)
+
+        result = pc.set_pitch(3)
+
+        assert result is True
+        assert pc.now_playing_transpose == 3
+        pc.stream_manager.set_pitch.assert_called_once_with(3)
+
+    def test_set_pitch_when_not_playing(self, test_prefs):
+        """Nothing to change if nothing is playing."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+
+        result = pc.set_pitch(3)
+
+        assert result is False
+
+    def test_set_pitch_leaves_transpose_unchanged_on_failure(self, test_prefs):
+        """A rejected/failed zmq command must not appear to have changed pitch."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc.is_playing = True
+        pc.now_playing_transpose = 1
+        pc.stream_manager.set_pitch = MagicMock(return_value=False)
+
+        result = pc.set_pitch(3)
+
+        assert result is False
+        assert pc.now_playing_transpose == 1
+
+
 class TestPlaybackControllerGetNowPlaying:
     """Tests for PlaybackController.get_now_playing method."""
 
@@ -384,6 +447,7 @@ class TestPlaybackControllerResetNowPlaying:
         pc = PlaybackController(test_prefs, events, filename_fn)
         pc.now_playing = "Test Song"
         pc.now_playing_user = "TestUser"
+        pc.now_playing_transpose = 2
         pc.is_playing = True
         pc.is_paused = False
 
@@ -393,3 +457,4 @@ class TestPlaybackControllerResetNowPlaying:
         assert pc.now_playing_user is None
         assert pc.is_playing is False
         assert pc.is_paused is True
+        assert pc.now_playing_transpose == 0

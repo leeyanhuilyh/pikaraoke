@@ -113,6 +113,8 @@ class MockPlaybackController:
         # End reasons passed to skip(), in order. Held on the instance so one
         # test cannot see another's calls.
         self.skipped_reasons: list[str] = []
+        # Lets tests simulate the live zmq command being rejected/unavailable.
+        self.set_pitch_should_succeed = True
 
     # Mirrors the real signature: transpose skips with its own reason so play
     # history can tell a restart from a real skip, and tests assert on it.
@@ -122,6 +124,12 @@ class MockPlaybackController:
             self.reset_now_playing()
             return True
         return False
+
+    def set_pitch(self, semitones: int) -> bool:
+        if not self.is_playing or not self.set_pitch_should_succeed:
+            return False
+        self.now_playing_transpose = semitones
+        return True
 
     def pause(self) -> bool:
         if self.is_playing:

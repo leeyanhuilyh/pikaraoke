@@ -534,31 +534,17 @@ class Karaoke:
         return new_path
 
     def transpose_current(self, semitones: int) -> None:
-        """Restart the current song with a new transpose value.
+        """Change the pitch of the currently playing song live, no restart.
 
         Args:
             semitones: Number of semitones to transpose.
         """
-        filename = self.playback_controller.now_playing_filename
-        user = self.playback_controller.now_playing_user
         now_playing = self.playback_controller.now_playing
-
-        if filename is None or user is None:
-            logging.warning("Cannot transpose: no song currently playing")
-            return
-        # Insert the same song at the top of the queue with transposition.
-        # The stream ends but the performance does not, so play history keeps
-        # the existing play open rather than logging a second one.
-        queued, message = self.queue_manager.enqueue(filename, user, semitones, True)
-        if not queued:
-            # Skipping now would end the song with nothing to restart it: the
-            # singer loses their turn, and play history holds the play open
-            # waiting for a restart that is never coming.
-            self.log_and_send(str(message), "danger")
+        if not self.playback_controller.set_pitch(semitones):
+            self.log_and_send(_("Failed to change pitch"), "danger")
             return
         # MSG: Message shown after the song is transposed, first is the semitones and then the song name
         self.log_and_send(_("Transposing by %s semitones: %s") % (semitones, now_playing))
-        self.playback_controller.skip(log_action=False, reason="transpose")
 
     def volume_change(self, vol_level: float) -> bool:
         """Set the volume level.
@@ -713,9 +699,7 @@ class Karaoke:
                             self.playback_controller.claim(song["file"])
                     if not song:
                         continue
-                    result = self.playback_controller.play_file(
-                        song["file"], song["user"], song["semitones"]
-                    )
+                    result = self.playback_controller.play_file(song["file"], song["user"])
 
                     # play_file() blocks only until the client connects, so this
                     # always lands before the song_ended that completes it.

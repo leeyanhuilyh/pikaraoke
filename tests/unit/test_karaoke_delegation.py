@@ -14,11 +14,11 @@ class TestKaraokeQueueInterface:
         assert isinstance(mock_karaoke.queue_manager.queue, list)
 
     def test_enqueue_accepts_all_parameters(self, mock_karaoke):
-        """enqueue() should accept file, user, semitones, and add_to_front."""
+        """enqueue() should accept file, user, and add_to_front."""
         result = mock_karaoke.queue_manager.enqueue("/songs/test---abc.mp4", "User1")
         assert result is not False
 
-        result = mock_karaoke.queue_manager.enqueue("/songs/test2---def.mp4", "User2", semitones=3)
+        result = mock_karaoke.queue_manager.enqueue("/songs/test2---def.mp4", "User2")
         assert result is not False
 
         result = mock_karaoke.queue_manager.enqueue(

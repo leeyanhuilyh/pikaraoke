@@ -114,7 +114,6 @@ class QueueManager:
         self,
         song_path: str,
         user: str = "Pikaraoke",
-        semitones: int = 0,
         add_to_front: bool = False,
         log_action: bool = True,
     ) -> list[bool | str]:
@@ -140,7 +139,6 @@ class QueueManager:
             "user": user,
             "file": song_path,
             "title": title,
-            "semitones": semitones,
         }
         if add_to_front:
             # MSG: Message shown after the song is added to the top of the queue

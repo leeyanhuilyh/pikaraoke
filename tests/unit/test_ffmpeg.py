@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pikaraoke.lib.ffmpeg import (
+    build_ffmpeg_cmd,
     get_ffmpeg_version,
     get_media_duration,
     is_ffmpeg_installed,
@@ -44,10 +45,10 @@ class TestGetFfmpegVersion:
 class TestIsTransposeEnabled:
     """Tests for the is_transpose_enabled function."""
 
-    def test_rubberband_available(self):
-        """Test when rubberband filter is available."""
+    def test_rubberband_and_azmq_available(self):
+        """Test when both rubberband and azmq filters are available."""
         mock_result = MagicMock()
-        mock_result.stdout = b"... rubberband ... other filters"
+        mock_result.stdout = b"... rubberband ... azmq ... other filters"
 
         with patch("subprocess.run", return_value=mock_result):
             assert is_transpose_enabled() is True
@@ -55,7 +56,15 @@ class TestIsTransposeEnabled:
     def test_rubberband_not_available(self):
         """Test when rubberband filter is not available."""
         mock_result = MagicMock()
-        mock_result.stdout = b"aecho, aresample, volume"
+        mock_result.stdout = b"aecho, aresample, volume, azmq"
+
+        with patch("subprocess.run", return_value=mock_result):
+            assert is_transpose_enabled() is False
+
+    def test_azmq_not_available(self):
+        """Test when azmq filter is missing, e.g. ffmpeg built without --enable-libzmq."""
+        mock_result = MagicMock()
+        mock_result.stdout = b"... rubberband ... other filters"
 
         with patch("subprocess.run", return_value=mock_result):
             assert is_transpose_enabled() is False
@@ -167,3 +176,47 @@ class TestSupportsHardwareH264EncodingIndexError:
         with patch("platform.machine", return_value="aarch64"):
             with patch("subprocess.run", side_effect=IndexError):
                 assert supports_hardware_h264_encoding() is False
+
+
+class TestBuildFfmpegCmdPitchControl:
+    """Tests for the live pitch-control (rubberband + azmq) filter graph."""
+
+    def _make_mock_fr(self):
+        mock_fr = MagicMock()
+        mock_fr.file_path = "/songs/test---abc123.mp4"
+        mock_fr.file_extension = ".mp4"
+        mock_fr.cdg_file_path = None
+        mock_fr.output_file = "/tmp/out.mp4"
+        return mock_fr
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_returns_plain_arg_list(self, mock_hw):
+        """build_ffmpeg_cmd returns args ready for subprocess, not an ffmpeg-python object."""
+        args = build_ffmpeg_cmd(self._make_mock_fr(), 25555, force_mp4_encoding=True)
+
+        assert isinstance(args, list)
+        assert all(isinstance(arg, str) for arg in args)
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_rubberband_always_present_starting_untransposed(self, mock_hw):
+        """Rubberband is always in the graph (at pitch=1.0) so pitch can be changed live later."""
+        args = build_ffmpeg_cmd(self._make_mock_fr(), 25555, force_mp4_encoding=True)
+
+        filter_complex = args[args.index("-filter_complex") + 1]
+        assert "rubberband=pitch=1.0" in filter_complex
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_azmq_bound_to_the_given_port(self, mock_hw):
+        """The azmq control socket binds to localhost on the given port."""
+        args = build_ffmpeg_cmd(self._make_mock_fr(), 25555, force_mp4_encoding=True)
+
+        filter_complex = args[args.index("-filter_complex") + 1]
+        assert r"azmq=bind_address='tcp\://127.0.0.1\:25555'" in filter_complex
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_audio_always_reencoded_to_aac(self, mock_hw):
+        """Audio can never take the stream-copy fast path since rubberband always runs."""
+        args = build_ffmpeg_cmd(self._make_mock_fr(), 25555, force_mp4_encoding=True)
+
+        assert "-acodec" in args
+        assert args[args.index("-acodec") + 1] == "aac"

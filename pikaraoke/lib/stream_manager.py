@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
@@ -12,11 +12,20 @@ from queue import Queue
 from threading import Thread
 from typing import Any
 
+import zmq
+
 from pikaraoke.lib.events import EventSystem
 from pikaraoke.lib.ffmpeg import build_ffmpeg_cmd
-from pikaraoke.lib.file_resolver import FileResolver, is_transcoding_required
+from pikaraoke.lib.file_resolver import FileResolver
 from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.url_prefix import normalize_url_base_path
+
+
+def _find_free_port() -> int:
+    """Find an available localhost TCP port for the pitch-control zmq socket."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 @dataclass
@@ -60,6 +69,8 @@ class StreamManager:
         preferences: PreferenceManager for configuration.
         ffmpeg_process: Currently running FFmpeg subprocess.
         ffmpeg_log: Queue for FFmpeg stderr output.
+        pitch_control_port: Localhost port the running process's azmq
+            command socket is bound to, or None if nothing is playing.
     """
 
     def __init__(
@@ -80,19 +91,26 @@ class StreamManager:
         self.ffmpeg_process = None
         self.ffmpeg_log: Queue | None = None
         self.base_path = normalize_url_base_path(base_path)
+        self.pitch_control_port: int | None = None
+        self._zmq_context = zmq.Context()
+        # Which process's unexpected exit has already been logged, so a crash
+        # after playback starts (nothing else polls the process by then) is
+        # reported exactly once instead of silently going unnoticed.
+        self._exit_logged_for: subprocess.Popen | None = None
 
     def _with_base_path(self, path: str) -> str:
         """Prefix relative app paths when PiKaraoke is mounted under a subpath."""
         return f"{self.base_path}{path}" if self.base_path else path
 
-    def play_file(self, file_path: str, semitones: int = 0) -> PlaybackResult:
+    def play_file(self, file_path: str) -> PlaybackResult:
         """Start playback of a media file.
 
-        Handles file resolution, transcoding, and stream setup.
+        Handles file resolution, transcoding, and stream setup. Always
+        transcodes: audio is always routed through rubberband so its pitch
+        can be changed live later, which rules out a raw stream copy.
 
         Args:
             file_path: Path to the media file to play.
-            semitones: Number of semitones to transpose (0 = no change).
 
         Returns:
             PlaybackResult with success status and stream information.
@@ -100,23 +118,11 @@ class StreamManager:
         from flask_babel import _
 
         streaming_format = self.streaming_format
-        normalize_audio = self.preferences.get_or_default("normalize_audio")
-        avsync = self.preferences.get_or_default("avsync")
         complete_transcode_before_play = self.preferences.get_or_default(
             "complete_transcode_before_play"
         )
 
         is_hls = streaming_format == "hls"
-
-        requires_transcoding = (
-            semitones != 0
-            or normalize_audio
-            or is_transcoding_required(file_path)
-            or avsync != 0
-            or is_hls
-        )
-
-        logging.debug(f"Requires transcoding: {requires_transcoding}")
 
         try:
             fr = FileResolver(file_path, streaming_format)
@@ -128,19 +134,12 @@ class StreamManager:
         # Set stream URL based on format
         if is_hls:
             stream_url_path = self._with_base_path(f"/stream/{fr.stream_uid}.m3u8")
+        elif complete_transcode_before_play:
+            stream_url_path = self._with_base_path(f"/stream/full/{fr.stream_uid}")
         else:
-            if complete_transcode_before_play or not requires_transcoding:
-                stream_url_path = self._with_base_path(f"/stream/full/{fr.stream_uid}")
-            else:
-                stream_url_path = self._with_base_path(f"/stream/{fr.stream_uid}.mp4")
+            stream_url_path = self._with_base_path(f"/stream/{fr.stream_uid}.mp4")
 
-        if not requires_transcoding:
-            is_transcoding_complete = self._copy_file(file_path, fr.output_file)
-            is_buffering_complete = True
-        else:
-            is_transcoding_complete, is_buffering_complete = self._transcode_file(
-                fr, semitones, is_hls
-            )
+        is_transcoding_complete, is_buffering_complete = self._transcode_file(fr, is_hls)
 
         subtitle_url = None
         if fr.ass_file_path:
@@ -161,32 +160,48 @@ class StreamManager:
             logging.error(error_message)
             return PlaybackResult(success=False, error=error_message)
 
-    def _copy_file(self, src_path: str, dest_path: str) -> bool:
-        """Copy a file that doesn't need transcoding.
+    def set_pitch(self, semitones: int) -> bool:
+        """Change the pitch of the currently playing audio live, via zmq.
+
+        Sends a runtime command to the running ffmpeg process's rubberband
+        filter instead of restarting it, so playback is uninterrupted.
 
         Args:
-            src_path: Source file path.
-            dest_path: Destination file path.
+            semitones: Number of semitones to transpose (0 = original key).
 
         Returns:
-            True if copy succeeded, False otherwise.
+            True if the command was sent and acknowledged, False otherwise
+            (e.g. nothing playing, or ffmpeg's command socket didn't respond).
         """
-        shutil.copy(src_path, dest_path)
-        max_retries = 5
-        while max_retries > 0:
-            if os.path.exists(dest_path):
-                return True
-            max_retries -= 1
-            time.sleep(1)
-        logging.debug(f"Copying file failed: {dest_path}")
-        return False
+        if self.ffmpeg_process is None or self.pitch_control_port is None:
+            logging.warning("Cannot change pitch: no song currently playing")
+            return False
 
-    def _transcode_file(self, fr: FileResolver, semitones: int, is_hls: bool) -> tuple[bool, bool]:
+        pitch_factor = 2 ** (semitones / 12)
+        socket_ = self._zmq_context.socket(zmq.REQ)
+        try:
+            socket_.setsockopt(zmq.LINGER, 0)
+            socket_.setsockopt(zmq.RCVTIMEO, 2000)
+            socket_.setsockopt(zmq.SNDTIMEO, 2000)
+            socket_.connect(f"tcp://127.0.0.1:{self.pitch_control_port}")
+            socket_.send_string(f"rubberband pitch {pitch_factor}")
+            reply = socket_.recv_string()
+        except zmq.error.ZMQError as e:
+            logging.error(f"Failed to send live pitch command: {e}")
+            return False
+        finally:
+            socket_.close()
+
+        if not reply.startswith("0 "):
+            logging.error(f"FFmpeg rejected pitch command: {reply}")
+            return False
+        return True
+
+    def _transcode_file(self, fr: FileResolver, is_hls: bool) -> tuple[bool, bool]:
         """Transcode a file using FFmpeg.
 
         Args:
             fr: FileResolver instance with file information.
-            semitones: Semitones to transpose.
             is_hls: Whether to use HLS streaming format.
 
         Returns:
@@ -202,16 +217,20 @@ class StreamManager:
         cdg_pixel_scaling = self.preferences.get_or_default("cdg_pixel_scaling")
         buffer_size = int(self.preferences.get_or_default("buffer_size")) * 1000
 
-        ffmpeg_cmd = build_ffmpeg_cmd(
+        self.pitch_control_port = _find_free_port()
+        ffmpeg_args = build_ffmpeg_cmd(
             fr,
-            semitones,
+            self.pitch_control_port,
             normalize_audio,
             not is_hls,  # force mp4 encoding
             complete_transcode_before_play,
             avsync,
             cdg_pixel_scaling,
         )
-        self.ffmpeg_process = ffmpeg_cmd.run_async(pipe_stderr=True, pipe_stdin=True)
+        self.ffmpeg_process = subprocess.Popen(
+            ["ffmpeg"] + ffmpeg_args, stdin=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self._exit_logged_for = None
 
         # FFmpeg outputs to stderr - prevent blocking reads
         self.ffmpeg_log = Queue()
@@ -339,12 +358,36 @@ class StreamManager:
         return False
 
     def log_ffmpeg_output(self) -> None:
-        """Log any pending FFmpeg output from the queue."""
+        """Log any pending FFmpeg output from the queue, and surface a crash.
+
+        Buffering readiness is only checked once, while starting playback;
+        once the stream is handed to the client nothing else watches the
+        process, so a later crash would otherwise run the clock out on the
+        client's own stall detector with no trace of why in the log.
+        """
         if self.ffmpeg_log is None:
             return
+        recent_lines: list[str] = []
         while self.ffmpeg_log.qsize() > 0:
             output = self.ffmpeg_log.get_nowait()
-            logging.debug("[FFMPEG] " + output.decode("utf-8", "ignore").strip())
+            line = output.decode("utf-8", "ignore").strip()
+            logging.debug("[FFMPEG] " + line)
+            recent_lines.append(line)
+
+        process = self.ffmpeg_process
+        exit_code = process.poll() if process else None
+        if (
+            process is not None
+            and process is not self._exit_logged_for
+            and exit_code
+            not in (
+                None,
+                0,
+            )
+        ):
+            self._exit_logged_for = process
+            tail = "\n".join(recent_lines[-20:])
+            logging.error(f"FFmpeg exited unexpectedly with code {exit_code}:\n{tail}")
 
     def kill_ffmpeg(self) -> None:
         """Terminate the running FFmpeg process gracefully.
@@ -367,3 +410,4 @@ class StreamManager:
                 logging.debug(f"FFmpeg termination exception: {e}")
             finally:
                 self.ffmpeg_process = None
+                self.pitch_control_port = None

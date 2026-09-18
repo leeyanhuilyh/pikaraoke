@@ -35,9 +35,8 @@ def pause():
 
 @controller_bp.route("/transpose/<semitones>", methods=["POST"])
 def transpose(semitones):
-    """Transpose (pitch shift) the current song."""
+    """Transpose (pitch shift) the current song live, without restarting it."""
     k = get_karaoke_instance()
-    broadcast_event("skip", "transpose current")
     k.transpose_current(int(semitones))
     return redirect(url_for("home.home"))
 

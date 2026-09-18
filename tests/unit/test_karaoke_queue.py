@@ -16,14 +16,7 @@ class TestEnqueue:
         assert mock_karaoke.queue_manager.queue[0]["file"] == "/songs/test---dQw4w9WgXcQ.mp4"
         assert mock_karaoke.queue_manager.queue[0]["user"] == "TestUser"
         assert mock_karaoke.queue_manager.queue[0]["title"] == "test"
-        assert mock_karaoke.queue_manager.queue[0]["semitones"] == 0
         assert result[0] is True
-
-    def test_enqueue_with_semitones(self, mock_karaoke):
-        """Test that enqueue respects semitones parameter."""
-        mock_karaoke.queue_manager.enqueue("/songs/test---abc123.mp4", "TestUser", semitones=3)
-
-        assert mock_karaoke.queue_manager.queue[0]["semitones"] == 3
 
     def test_enqueue_duplicate_song_rejected(self, mock_karaoke):
         """Test that the same song cannot be added twice."""
@@ -206,7 +199,7 @@ class TestRenameSong:
     NEW_STEM = "New Name---dQw4w9WgXcQ"
 
     def test_the_queue_entry_follows_the_file(self, mock_karaoke):
-        mock_karaoke.queue_manager.enqueue(self.SONG, "Singer", semitones=3)
+        mock_karaoke.queue_manager.enqueue(self.SONG, "Singer")
 
         new_path = mock_karaoke.rename_song(self.SONG, self.NEW_STEM)
 
@@ -214,7 +207,6 @@ class TestRenameSong:
         assert entry["file"] == new_path
         assert entry["title"] == "New Name"
         assert entry["user"] == "Singer"
-        assert entry["semitones"] == 3
 
     def test_the_position_is_kept(self, mock_karaoke):
         mock_karaoke.queue_manager.enqueue("/songs/First---aaaaaaaaaaa.mp4", "A")

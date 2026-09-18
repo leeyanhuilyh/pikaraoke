@@ -5,6 +5,7 @@ from queue import Queue
 from unittest.mock import MagicMock, patch
 
 import pytest
+import zmq
 
 from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.stream_manager import PlaybackResult, StreamManager, enqueue_output
@@ -133,38 +134,6 @@ class TestStreamManagerKillFfmpeg:
         # Should not raise
         sm.kill_ffmpeg()
         assert sm.ffmpeg_process is None
-
-
-class TestStreamManagerCopyFile:
-    """Tests for StreamManager._copy_file method."""
-
-    def test_copy_file_success(self, tmp_path, test_prefs):
-        """Test successful file copy."""
-        sm = StreamManager(test_prefs)
-
-        src_file = tmp_path / "source.mp4"
-        src_file.write_bytes(b"video content")
-        dest_file = tmp_path / "dest.mp4"
-
-        result = sm._copy_file(str(src_file), str(dest_file))
-
-        assert result is True
-        assert dest_file.exists()
-        assert dest_file.read_bytes() == b"video content"
-
-    @patch("pikaraoke.lib.stream_manager.time")
-    @patch("pikaraoke.lib.stream_manager.os.path.exists", return_value=False)
-    @patch("pikaraoke.lib.stream_manager.shutil")
-    def test_copy_file_returns_false_when_dest_never_appears(
-        self, mock_shutil, mock_exists, mock_time, test_prefs
-    ):
-        """Test _copy_file returns False when destination never appears after copy."""
-        sm = StreamManager(test_prefs)
-
-        result = sm._copy_file("/src/file.mp4", "/dest/file.mp4")
-
-        assert result is False
-        mock_shutil.copy.assert_called_once()
 
 
 class TestStreamManagerCheckMp4Buffer:
@@ -329,105 +298,123 @@ class TestStreamManagerTranscodeFile:
         mock_fr.get_current_stream_size.return_value = 500000
         return mock_fr
 
-    def _make_mock_ffmpeg(self, mock_build_cmd, poll_return: int | None = 0):
-        """Create mock FFmpeg command and process, wired to build_ffmpeg_cmd."""
+    def _make_mock_ffmpeg(self, mock_popen, poll_return: int | None = 0):
+        """Wire subprocess.Popen to return a mock process."""
         mock_process = MagicMock()
         mock_process.poll.return_value = poll_return
-        mock_cmd = MagicMock()
-        mock_cmd.run_async.return_value = mock_process
-        mock_build_cmd.return_value = mock_cmd
-        return mock_cmd, mock_process
+        mock_popen.return_value = mock_process
+        return mock_process
 
+    @patch("pikaraoke.lib.stream_manager.subprocess.Popen")
     @patch("pikaraoke.lib.stream_manager.Thread")
     @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
-    def test_transcode_success(self, mock_build_cmd, mock_thread, test_prefs):
+    def test_transcode_success(self, mock_build_cmd, mock_thread, mock_popen, test_prefs):
         """Test successful transcoding when FFmpeg exits with code 0."""
         sm = StreamManager(test_prefs)
-        mock_cmd, _ = self._make_mock_ffmpeg(mock_build_cmd, poll_return=0)
+        mock_build_cmd.return_value = ["-i", "in.mp4", "out.mp4"]
+        self._make_mock_ffmpeg(mock_popen, poll_return=0)
 
-        is_complete, is_buffered = sm._transcode_file(
-            self._make_mock_fr(), semitones=2, is_hls=False
-        )
+        is_complete, is_buffered = sm._transcode_file(self._make_mock_fr(), is_hls=False)
 
         assert is_complete is True
         mock_build_cmd.assert_called_once()
-        mock_cmd.run_async.assert_called_once_with(pipe_stderr=True, pipe_stdin=True)
+        mock_popen.assert_called_once()
 
+    @patch("pikaraoke.lib.stream_manager.subprocess.Popen")
     @patch("pikaraoke.lib.stream_manager.Thread")
     @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
-    def test_transcode_ffmpeg_error(self, mock_build_cmd, mock_thread, test_prefs):
+    def test_transcode_ffmpeg_error(self, mock_build_cmd, mock_thread, mock_popen, test_prefs):
         """Test transcoding failure when FFmpeg exits with non-zero code."""
         sm = StreamManager(test_prefs)
-        self._make_mock_ffmpeg(mock_build_cmd, poll_return=1)
+        mock_build_cmd.return_value = []
+        self._make_mock_ffmpeg(mock_popen, poll_return=1)
 
-        is_complete, is_buffered = sm._transcode_file(
-            self._make_mock_fr(), semitones=0, is_hls=False
-        )
+        is_complete, is_buffered = sm._transcode_file(self._make_mock_fr(), is_hls=False)
 
         assert is_complete is False
         assert is_buffered is False
 
+    @patch("pikaraoke.lib.stream_manager.subprocess.Popen")
     @patch("pikaraoke.lib.stream_manager.Thread")
     @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
     def test_transcode_buffering_complete_before_finish(
-        self, mock_build_cmd, mock_thread, test_prefs
+        self, mock_build_cmd, mock_thread, mock_popen, test_prefs
     ):
         """Test that buffering can complete before transcoding finishes."""
         sm = StreamManager(test_prefs)
-        self._make_mock_ffmpeg(mock_build_cmd, poll_return=None)
+        mock_build_cmd.return_value = []
+        self._make_mock_ffmpeg(mock_popen, poll_return=None)
 
         with patch.object(sm, "_check_mp4_buffer", return_value=True):
-            is_complete, is_buffered = sm._transcode_file(
-                self._make_mock_fr(), semitones=0, is_hls=False
-            )
+            is_complete, is_buffered = sm._transcode_file(self._make_mock_fr(), is_hls=False)
 
         assert is_complete is False
         assert is_buffered is True
 
+    @patch("pikaraoke.lib.stream_manager.subprocess.Popen")
     @patch("pikaraoke.lib.stream_manager.Thread")
     @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
-    def test_transcode_hls_buffering(self, mock_build_cmd, mock_thread, test_prefs):
+    def test_transcode_hls_buffering(self, mock_build_cmd, mock_thread, mock_popen, test_prefs):
         """Test HLS buffering check is used when is_hls=True."""
         sm = StreamManager(test_prefs)
-        self._make_mock_ffmpeg(mock_build_cmd, poll_return=None)
+        mock_build_cmd.return_value = []
+        self._make_mock_ffmpeg(mock_popen, poll_return=None)
 
         with patch.object(sm, "_check_hls_buffer", return_value=True) as mock_hls:
-            is_complete, is_buffered = sm._transcode_file(
-                self._make_mock_fr(), semitones=0, is_hls=True
-            )
+            is_complete, is_buffered = sm._transcode_file(self._make_mock_fr(), is_hls=True)
 
         mock_hls.assert_called()
         assert is_buffered is True
 
     @patch("pikaraoke.lib.stream_manager.time")
+    @patch("pikaraoke.lib.stream_manager.subprocess.Popen")
     @patch("pikaraoke.lib.stream_manager.Thread")
     @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
     def test_transcode_max_retries_exceeded(
-        self, mock_build_cmd, mock_thread, mock_time, test_prefs
+        self, mock_build_cmd, mock_thread, mock_popen, mock_time, test_prefs
     ):
         """Test that max retries limit prevents infinite loop."""
         sm = StreamManager(test_prefs)
-        self._make_mock_ffmpeg(mock_build_cmd, poll_return=None)
+        mock_build_cmd.return_value = []
+        self._make_mock_ffmpeg(mock_popen, poll_return=None)
 
         with patch.object(sm, "_check_mp4_buffer", return_value=False):
-            is_complete, is_buffered = sm._transcode_file(
-                self._make_mock_fr(), semitones=0, is_hls=False
-            )
+            is_complete, is_buffered = sm._transcode_file(self._make_mock_fr(), is_hls=False)
 
         assert is_complete is False
         assert is_buffered is False
 
+    @patch("pikaraoke.lib.stream_manager.subprocess.Popen")
     @patch("pikaraoke.lib.stream_manager.Thread")
     @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
-    def test_transcode_kills_existing_ffmpeg(self, mock_build_cmd, mock_thread, test_prefs):
+    def test_transcode_kills_existing_ffmpeg(
+        self, mock_build_cmd, mock_thread, mock_popen, test_prefs
+    ):
         """Test that _transcode_file kills any existing FFmpeg process first."""
         sm = StreamManager(test_prefs)
-        self._make_mock_ffmpeg(mock_build_cmd, poll_return=0)
+        mock_build_cmd.return_value = []
+        self._make_mock_ffmpeg(mock_popen, poll_return=0)
 
         with patch.object(sm, "kill_ffmpeg") as mock_kill:
-            sm._transcode_file(self._make_mock_fr(), semitones=0, is_hls=False)
+            sm._transcode_file(self._make_mock_fr(), is_hls=False)
 
         mock_kill.assert_called_once()
+
+    @patch("pikaraoke.lib.stream_manager.subprocess.Popen")
+    @patch("pikaraoke.lib.stream_manager.Thread")
+    @patch("pikaraoke.lib.stream_manager.build_ffmpeg_cmd")
+    def test_transcode_picks_a_fresh_pitch_control_port(
+        self, mock_build_cmd, mock_thread, mock_popen, test_prefs
+    ):
+        """Each transcode gets its own free port for the live pitch-control socket."""
+        sm = StreamManager(test_prefs)
+        mock_build_cmd.return_value = []
+        self._make_mock_ffmpeg(mock_popen, poll_return=0)
+
+        sm._transcode_file(self._make_mock_fr(), is_hls=False)
+
+        assert sm.pitch_control_port is not None
+        assert mock_build_cmd.call_args.args[1] == sm.pitch_control_port
 
 
 class TestStreamManagerPlayFile:
@@ -461,29 +448,8 @@ class TestStreamManagerPlayFile:
         assert result.error is not None
 
     @patch("flask_babel._", side_effect=lambda x: x)
-    @patch("pikaraoke.lib.stream_manager.is_transcoding_required", return_value=False)
     @patch("pikaraoke.lib.stream_manager.FileResolver")
-    def test_play_file_copies_when_no_transcoding_needed(
-        self, mock_resolver_class, mock_transcode_check, mock_gettext, test_prefs
-    ):
-        """Test play_file copies file when no transcoding required."""
-        sm = StreamManager(test_prefs, streaming_format="mp4")
-        self._setup_resolver(mock_resolver_class, duration=180)
-
-        with patch.object(sm, "_copy_file", return_value=True) as mock_copy:
-            result = sm.play_file("/songs/test.mp4")
-
-        mock_copy.assert_called_once()
-        assert isinstance(result, PlaybackResult)
-        assert result.success is True
-        assert result.duration == 180
-
-    @patch("flask_babel._", side_effect=lambda x: x)
-    @patch("pikaraoke.lib.stream_manager.is_transcoding_required", return_value=False)
-    @patch("pikaraoke.lib.stream_manager.FileResolver")
-    def test_play_file_hls_stream_url(
-        self, mock_resolver_class, mock_transcode_check, mock_gettext, test_prefs
-    ):
+    def test_play_file_hls_stream_url(self, mock_resolver_class, mock_gettext, test_prefs):
         """Test play_file produces HLS stream URL when format is hls."""
         sm = StreamManager(test_prefs, streaming_format="hls")
         self._setup_resolver(mock_resolver_class, output_ext="m3u8")
@@ -495,10 +461,9 @@ class TestStreamManagerPlayFile:
         assert result.stream_url == "/stream/12345.m3u8"
 
     @patch("flask_babel._", side_effect=lambda x: x)
-    @patch("pikaraoke.lib.stream_manager.is_transcoding_required", return_value=True)
     @patch("pikaraoke.lib.stream_manager.FileResolver")
     def test_play_file_mp4_progressive_stream_url(
-        self, mock_resolver_class, mock_transcode_check, mock_gettext, test_prefs
+        self, mock_resolver_class, mock_gettext, test_prefs
     ):
         """Test play_file produces progressive MP4 URL when buffering."""
         sm = StreamManager(test_prefs, streaming_format="mp4")
@@ -511,11 +476,8 @@ class TestStreamManagerPlayFile:
         assert result.stream_url == "/stream/12345.mp4"
 
     @patch("flask_babel._", side_effect=lambda x: x)
-    @patch("pikaraoke.lib.stream_manager.is_transcoding_required", return_value=True)
     @patch("pikaraoke.lib.stream_manager.FileResolver")
-    def test_play_file_mp4_full_transcode_url(
-        self, mock_resolver_class, mock_transcode_check, mock_gettext, test_prefs
-    ):
+    def test_play_file_mp4_full_transcode_url(self, mock_resolver_class, mock_gettext, test_prefs):
         """Test play_file produces full transcode URL when setting enabled."""
         test_prefs.set("complete_transcode_before_play", True)
         sm = StreamManager(test_prefs, streaming_format="mp4")
@@ -528,26 +490,22 @@ class TestStreamManagerPlayFile:
         assert result.stream_url == "/stream/full/12345"
 
     @patch("flask_babel._", side_effect=lambda x: x)
-    @patch("pikaraoke.lib.stream_manager.is_transcoding_required", return_value=False)
     @patch("pikaraoke.lib.stream_manager.FileResolver")
-    def test_play_file_includes_subtitle_url(
-        self, mock_resolver_class, mock_transcode_check, mock_gettext, test_prefs
-    ):
+    def test_play_file_includes_subtitle_url(self, mock_resolver_class, mock_gettext, test_prefs):
         """Test play_file includes subtitle URL when subtitle file exists."""
         sm = StreamManager(test_prefs, streaming_format="mp4")
         self._setup_resolver(mock_resolver_class, duration=180, ass_file_path="/tmp/12345.ass")
 
-        with patch.object(sm, "_copy_file", return_value=True):
+        with patch.object(sm, "_transcode_file", return_value=(True, False)):
             result = sm.play_file("/songs/test.mp4")
 
         assert result.success is True
         assert result.subtitle_url == "/subtitle/12345"
 
     @patch("flask_babel._", side_effect=lambda x: x)
-    @patch("pikaraoke.lib.stream_manager.is_transcoding_required", return_value=True)
     @patch("pikaraoke.lib.stream_manager.FileResolver")
     def test_play_file_returns_failure_when_stream_not_ready(
-        self, mock_resolver_class, mock_transcode_check, mock_gettext, test_prefs
+        self, mock_resolver_class, mock_gettext, test_prefs
     ):
         """Test play_file returns failure when neither transcoding nor buffering completes."""
         sm = StreamManager(test_prefs, streaming_format="mp4")
@@ -558,3 +516,54 @@ class TestStreamManagerPlayFile:
 
         assert result.success is False
         assert result.error is not None
+
+
+class TestStreamManagerSetPitch:
+    """Tests for StreamManager.set_pitch, the live zmq pitch-change command."""
+
+    def test_returns_false_when_nothing_playing(self, test_prefs):
+        """Nothing to control if ffmpeg isn't running."""
+        sm = StreamManager(test_prefs)
+
+        assert sm.set_pitch(2) is False
+
+    def test_sends_command_and_returns_true_on_success(self, test_prefs):
+        """A successful zmq round-trip changes pitch and reports success."""
+        sm = StreamManager(test_prefs)
+        sm.ffmpeg_process = MagicMock()
+        sm.pitch_control_port = 25555
+
+        mock_socket = MagicMock()
+        mock_socket.recv_string.return_value = "0 Success"
+        sm._zmq_context = MagicMock()
+        sm._zmq_context.socket.return_value = mock_socket
+
+        assert sm.set_pitch(2) is True
+        sent = mock_socket.send_string.call_args[0][0]
+        assert sent.startswith("rubberband pitch ")
+
+    def test_returns_false_when_ffmpeg_rejects_command(self, test_prefs):
+        """A non-'0 ...' reply means ffmpeg didn't apply the change."""
+        sm = StreamManager(test_prefs)
+        sm.ffmpeg_process = MagicMock()
+        sm.pitch_control_port = 25555
+
+        mock_socket = MagicMock()
+        mock_socket.recv_string.return_value = "38 Function not implemented"
+        sm._zmq_context = MagicMock()
+        sm._zmq_context.socket.return_value = mock_socket
+
+        assert sm.set_pitch(2) is False
+
+    def test_returns_false_on_zmq_error(self, test_prefs):
+        """A socket-level failure (e.g. timeout) must not raise."""
+        sm = StreamManager(test_prefs)
+        sm.ffmpeg_process = MagicMock()
+        sm.pitch_control_port = 25555
+
+        mock_socket = MagicMock()
+        mock_socket.connect.side_effect = zmq.error.ZMQError("boom")
+        sm._zmq_context = MagicMock()
+        sm._zmq_context.socket.return_value = mock_socket
+
+        assert sm.set_pitch(2) is False

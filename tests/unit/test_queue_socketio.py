@@ -122,14 +122,13 @@ class TestSocketIOEventFormats:
     def test_queue_item_has_required_fields(self, karaoke_with_socketio):
         """Queue items contain fields required by frontend."""
         k = karaoke_with_socketio
-        k.queue_manager.enqueue("/songs/Artist - Song---dQw4w9WgXcQ.mp4", "TestUser", semitones=2)
+        k.queue_manager.enqueue("/songs/Artist - Song---dQw4w9WgXcQ.mp4", "TestUser")
 
         queue_item = k.queue_manager.queue[0]
 
         assert queue_item["file"] == "/songs/Artist - Song---dQw4w9WgXcQ.mp4"
         assert queue_item["user"] == "TestUser"
         assert queue_item["title"] == "Artist - Song"
-        assert queue_item["semitones"] == 2
 
     def test_now_playing_payload_has_required_fields(self, karaoke_with_socketio):
         """now_playing event payload contains all fields required by frontend."""

@@ -26,11 +26,12 @@ class PlaybackController:
         now_playing: Title of the currently playing song.
         now_playing_filename: File path of the currently playing song.
         now_playing_user: User who queued the current song.
-        now_playing_transpose: Semitones to transpose current song.
+        now_playing_transpose: Semitones the current song is transposed by.
         now_playing_duration: Duration of current song in seconds.
         now_playing_url: Stream URL for current song.
         now_playing_subtitle_url: URL path for subtitles.
-        now_playing_position: Current playback position in seconds.
+        now_playing_position: Current playback position within the playing
+            stream, in seconds.
         is_paused: Whether playback is paused.
         is_playing: Whether a song is currently playing.
         ffmpeg_process: Currently running FFmpeg subprocess.
@@ -74,7 +75,7 @@ class PlaybackController:
         """Get the current FFmpeg process."""
         return self.stream_manager.ffmpeg_process
 
-    def play_file(self, file_path: str, user: str, semitones: int = 0) -> PlaybackResult:
+    def play_file(self, file_path: str, user: str) -> PlaybackResult:
         """Start playback of a media file.
 
         Blocks until client connects or timeout occurs.
@@ -82,7 +83,6 @@ class PlaybackController:
         Args:
             file_path: Path to the media file to play.
             user: User who queued the song.
-            semitones: Number of semitones to transpose (0 = no change).
 
         Returns:
             PlaybackResult with success status and stream information.
@@ -93,13 +93,11 @@ class PlaybackController:
             self.now_playing_filename = None
             return PlaybackResult(success=False, error=error_msg)
 
-        logging.info(
-            f"Playing file: {file_path} for user: {user}, transposed {semitones} semitones"
-        )
+        logging.info(f"Playing file: {file_path} for user: {user}")
 
         self.claim(file_path)
 
-        result = self.stream_manager.play_file(file_path, semitones)
+        result = self.stream_manager.play_file(file_path)
 
         if not result.success:
             self.now_playing_filename = None
@@ -107,7 +105,7 @@ class PlaybackController:
 
         self.now_playing = self.filename_from_path(file_path, remove_youtube_id=True)
         self.now_playing_user = user
-        self.now_playing_transpose = semitones
+        self.now_playing_transpose = 0
         self.now_playing_duration = result.duration
         self.now_playing_url = result.stream_url
         self.now_playing_subtitle_url = result.subtitle_url
@@ -194,6 +192,25 @@ class PlaybackController:
         else:
             logging.warning("Tried to skip, but no file is playing!")
             return False
+
+    def set_pitch(self, semitones: int) -> bool:
+        """Change the pitch of the currently playing song live, no restart.
+
+        Args:
+            semitones: Number of semitones to transpose (0 = original key).
+
+        Returns:
+            True if successful, False if nothing playing or the command
+            wasn't acknowledged.
+        """
+        if not self.is_playing:
+            logging.warning("Tried to change pitch, but no file is playing!")
+            return False
+        if not self.stream_manager.set_pitch(semitones):
+            return False
+        self.now_playing_transpose = semitones
+        self.events.emit("now_playing_update")
+        return True
 
     def pause(self) -> bool:
         """Toggle pause state of the current song.

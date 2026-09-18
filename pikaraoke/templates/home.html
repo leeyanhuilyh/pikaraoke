@@ -46,13 +46,8 @@
 			$("#up-next").html({{ _('No song is queued.') | tojson }});
 		}
 
-		if (np.now_playing_transpose != 0) {
-			$("#transpose").val(np.now_playing_transpose);
-			$("#semitones-label").html(getSemitonesLabel(np.now_playing_transpose));
-		} else {
-			$("#transpose").val(0);
-			$("#semitones-label").html(getSemitonesLabel(np.now_playing_transpose));
-		}
+		$("#transpose").val(np.now_playing_transpose);
+		$("#current-key-value").html(getSemitonesLabel(np.now_playing_transpose));
 
 		// set the volume slider to the current volume
 		if (np.volume != volume) {
@@ -94,18 +89,8 @@
 		);
 
 		$("#submit-transpose").click(function () {
-			var value;
-			if (slider) {
-				value = slider.value;
-			} else {
-				value = 0;
-			}
-			r = confirm(window.translations.confirmTranspose.replace("{label}", getSemitonesLabel(value)));
-			if (r) {
-				$.post(window.pikaraokeConfig.basePath + "/transpose/" + value);
-			}
-			slider.value = 0;
-			output.innerHTML = getSemitonesLabel(slider.value);
+			var value = slider ? slider.value : 0;
+			$.post(window.pikaraokeConfig.basePath + "/transpose/" + value);
 		});
 
 		$("#pause-resume").click(function () {
@@ -281,6 +266,10 @@
 		<div>
 			{# MSG: Title of a control to change the key/pitch of the playing song. #}
 			<h4>{% trans %}Change Key{% endtrans %}</h4>
+			<p class="is-size-7 has-text-grey">
+				{# MSG: Label showing the key the song is currently playing in, followed by a value like "+2 semitones". #}
+				{% trans %}Current key:{% endtrans %} <span id="current-key-value"></span>
+			</p>
 		</div>
 		<div class="is-flex">
 			<h4 id="semitones-label"></h4>
