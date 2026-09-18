@@ -1,0 +1,3 @@
+[submodule "vendor/demucs"]
+	path = vendor/demucs
+	url = git@github.com:leeyanhuilyh/demucs.git
