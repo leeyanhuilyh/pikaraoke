@@ -15,10 +15,11 @@
 		$("#semitones-label").html(getSemitonesLabel(currentTranspose));
 		$("#transpose-down").prop("disabled", currentTranspose <= minTranspose);
 		$("#transpose-up").prop("disabled", currentTranspose >= maxTranspose);
+		$("#transpose-reset").prop("disabled", currentTranspose === 0);
 	}
 
-	function stepTranspose(step) {
-		var target = Math.min(maxTranspose, Math.max(minTranspose, currentTranspose + step));
+	function setTranspose(target) {
+		target = Math.min(maxTranspose, Math.max(minTranspose, target));
 		if (target === currentTranspose) return;
 		currentTranspose = target;
 		renderTranspose();
@@ -99,11 +100,15 @@
 		);
 
 		$("#transpose-down").click(function () {
-			stepTranspose(-1);
+			setTranspose(currentTranspose - 1);
 		});
 
 		$("#transpose-up").click(function () {
-			stepTranspose(1);
+			setTranspose(currentTranspose + 1);
+		});
+
+		$("#transpose-reset").click(function () {
+			setTranspose(0);
 		});
 
 		$("#pause-resume").click(function () {
@@ -290,6 +295,10 @@
 		<h4 id="semitones-label" style="margin: 0; min-width: 120px; text-align: center"></h4>
 		{# MSG: Title attribute on the button to raise the key of the playing song by one semitone. #}
 		<button id="transpose-up" class="button is-rounded" title="{{ _('Raise key') }}">+</button>
+		{# MSG: Label on the button that returns the song to the key it was recorded in. #}
+		<button id="transpose-reset" class="button is-rounded is-small" style="margin-left: auto">
+			{% trans %}Original Key{% endtrans %}
+		</button>
 	</div>
 	{% endif %}
 
