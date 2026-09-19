@@ -250,13 +250,12 @@ class PlaybackController:
 
         Returns:
             True if pre-rendering is active for the current song and this
-            pitch is in its window. The rendition does not have to be
-            finished - every windowed pitch is declared in the master
-            playlist the player already loaded, so it can be switched to
-            while it is still rendering. Only a pitch outside the window
-            needs a new playlist, and therefore a restart.
+            pitch is one the master playlist declares. The rendition does
+            not have to exist yet - it can be rendered on demand and
+            switched to while it is still writing. Only a pitch outside the
+            declared range needs a new playlist, and therefore a restart.
         """
-        return self._using_rendition_manager and self.rendition_manager.is_in_window(semitones)
+        return self._using_rendition_manager and self.rendition_manager.is_switchable(semitones)
 
     def prepare_pitch_switch(self, semitones: int) -> bool:
         """Get a windowed pitch ready to switch to, rendering it next if needed.
@@ -285,9 +284,6 @@ class PlaybackController:
             "now_playing_subtitle_url": self.now_playing_subtitle_url,
             "now_playing_position": self.now_playing_position,
             "is_paused": self.is_paused,
-            "rendered_semitones": (
-                self.rendition_manager.rendered_semitones() if self._using_rendition_manager else []
-            ),
         }
 
     def reset_now_playing(self) -> None:

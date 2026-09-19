@@ -7,31 +7,22 @@
 		window.socket = io({ path: window.pikaraokeConfig.socketioPath });
 	}
 
-	function renderTransposeQuickSelect(np) {
-		// Quick-select buttons for pitches that are already pre-rendered
-		// (rendition pre-caching, when enabled): clicking one switches the
-		// audio rendition instantly instead of restarting the song. Pitches
-		// outside the pre-rendered window still go through the slider below.
-		var container = $("#transpose-quick-select");
-		if (!container.length) return;
-		var semitones = np.rendered_semitones || [];
-		container.empty();
-		if (semitones.length === 0) {
-			container.hide();
-			return;
-		}
-		container.show();
-		semitones.forEach(function (s) {
-			var isActive = s === np.now_playing_transpose;
-			$("<button>")
-				.addClass("button is-rounded is-small")
-				.addClass(isActive ? "is-success" : "")
-				.text(getSemitonesLabel(s))
-				.on("click", function () {
-					$.post(window.pikaraokeConfig.basePath + "/transpose/" + s);
-				})
-				.appendTo(container);
-		});
+	var currentTranspose = {{ transpose_value|default(0) }};
+	var minTranspose = {{ min_transpose|default(-6) }};
+	var maxTranspose = {{ max_transpose|default(6) }};
+
+	function renderTranspose() {
+		$("#semitones-label").html(getSemitonesLabel(currentTranspose));
+		$("#transpose-down").prop("disabled", currentTranspose <= minTranspose);
+		$("#transpose-up").prop("disabled", currentTranspose >= maxTranspose);
+	}
+
+	function stepTranspose(step) {
+		var target = Math.min(maxTranspose, Math.max(minTranspose, currentTranspose + step));
+		if (target === currentTranspose) return;
+		currentTranspose = target;
+		renderTranspose();
+		$.post(window.pikaraokeConfig.basePath + "/transpose/" + target);
 	}
 
 	function loadNowPlaying() {
@@ -73,15 +64,8 @@
 			$("#up-next").html({{ _('No song is queued.') | tojson }});
 		}
 
-		if (np.now_playing_transpose != 0) {
-			$("#transpose").val(np.now_playing_transpose);
-			$("#semitones-label").html(getSemitonesLabel(np.now_playing_transpose));
-		} else {
-			$("#transpose").val(0);
-			$("#semitones-label").html(getSemitonesLabel(np.now_playing_transpose));
-		}
-
-		renderTransposeQuickSelect(np);
+		currentTranspose = np.now_playing_transpose || 0;
+		renderTranspose();
 
 		// set the volume slider to the current volume
 		if (np.volume != volume) {
@@ -104,15 +88,7 @@
 	$(function () {
 		$(".control-box").hide();
 
-		var slider = document.getElementById("transpose");
-		var output = document.getElementById("semitones-label");
-		if (slider && output) {
-			output.innerHTML = getSemitonesLabel(slider.value);
-			// Update the current slider value (each time you drag the slider handle)
-			slider.oninput = function () {
-				output.innerHTML = getSemitonesLabel(slider.value);
-			};
-		}
+		renderTranspose();
 
 		$("#volume-slider").on(
 			"input",
@@ -122,19 +98,12 @@
 			}, 500)
 		);
 
-		$("#submit-transpose").click(function () {
-			var value;
-			if (slider) {
-				value = slider.value;
-			} else {
-				value = 0;
-			}
-			r = confirm(window.translations.confirmTranspose.replace("{label}", getSemitonesLabel(value)));
-			if (r) {
-				$.post(window.pikaraokeConfig.basePath + "/transpose/" + value);
-			}
-			slider.value = 0;
-			output.innerHTML = getSemitonesLabel(slider.value);
+		$("#transpose-down").click(function () {
+			stepTranspose(-1);
+		});
+
+		$("#transpose-up").click(function () {
+			stepTranspose(1);
 		});
 
 		$("#pause-resume").click(function () {
@@ -306,34 +275,21 @@
 	<hr />
 
 	{% if is_transpose_enabled %}
-	<div id="transpose-quick-select" class="is-flex" style="flex-wrap: wrap; gap: 4px; margin-bottom: 8px; display: none"></div>
 	<div class="is-flex" style="justify-content: space-between">
 		<div>
 			{# MSG: Title of a control to change the key/pitch of the playing song. #}
 			<h4>{% trans %}Change Key{% endtrans %}</h4>
 		</div>
 		<div class="is-flex">
-			<h4 id="semitones-label"></h4>
 			<a id="semitones-info"> <i class="icon icon-info-circled-1" title="Info"></i></a>
 		</div>
 	</div>
-	<div style="width: 100%">
-		<div class="is-flex">
-			<input
-				type="range"
-				min="-12"
-				max="12"
-				value="0"
-				width="300px"
-				class="transpose-slider"
-				id="transpose"
-				style="width: 100%"
-			/>
-			<button id="submit-transpose" class="button is-rounded is-small" style="margin-left: 10px">
-				{# MSG: Label on the button to confirm the change in key/pitch of the playing song. #} {% trans %}Change{%
-				endtrans %}
-			</button>
-		</div>
+	<div class="is-flex" style="align-items: center; gap: 12px">
+		{# MSG: Title attribute on the button to lower the key of the playing song by one semitone. #}
+		<button id="transpose-down" class="button is-rounded" title="{{ _('Lower key') }}">&minus;</button>
+		<h4 id="semitones-label" style="margin: 0; min-width: 120px; text-align: center"></h4>
+		{# MSG: Title attribute on the button to raise the key of the playing song by one semitone. #}
+		<button id="transpose-up" class="button is-rounded" title="{{ _('Raise key') }}">+</button>
 	</div>
 	{% endif %}
 

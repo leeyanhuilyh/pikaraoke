@@ -391,25 +391,6 @@ class TestPlaybackControllerGetNowPlaying:
         assert state["now_playing_transpose"] == 2
         assert state["is_paused"] is False
 
-    def test_rendered_semitones_empty_when_rendition_manager_not_active(self, test_prefs):
-        """No pre-rendering happened for this song - nothing to offer as a fast switch."""
-        events = EventSystem()
-        filename_fn = lambda x, remove_youtube_id=True: x
-
-        pc = PlaybackController(test_prefs, events, filename_fn)
-
-        assert pc.get_now_playing()["rendered_semitones"] == []
-
-    def test_rendered_semitones_reflects_rendition_manager_when_active(self, test_prefs):
-        events = EventSystem()
-        filename_fn = lambda x, remove_youtube_id=True: x
-
-        pc = PlaybackController(test_prefs, events, filename_fn)
-        pc._using_rendition_manager = True
-        pc.rendition_manager.rendered_semitones = MagicMock(return_value=[-2, 0, 2])
-
-        assert pc.get_now_playing()["rendered_semitones"] == [-2, 0, 2]
-
 
 class TestPlaybackControllerCanFastSwitch:
     """Tests for PlaybackController.can_fast_switch."""
@@ -419,28 +400,28 @@ class TestPlaybackControllerCanFastSwitch:
         filename_fn = lambda x, remove_youtube_id=True: x
 
         pc = PlaybackController(test_prefs, events, filename_fn)
-        pc.rendition_manager.is_in_window = MagicMock(return_value=True)
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
 
         assert pc.can_fast_switch(2) is False
 
-    def test_false_outside_the_window(self, test_prefs):
+    def test_false_outside_the_declared_range(self, test_prefs):
         events = EventSystem()
         filename_fn = lambda x, remove_youtube_id=True: x
 
         pc = PlaybackController(test_prefs, events, filename_fn)
         pc._using_rendition_manager = True
-        pc.rendition_manager.is_in_window = MagicMock(return_value=False)
+        pc.rendition_manager.is_switchable = MagicMock(return_value=False)
 
         assert pc.can_fast_switch(7) is False
 
-    def test_true_for_a_windowed_pitch_that_is_not_rendered_yet(self, test_prefs):
+    def test_true_for_a_declared_pitch_that_is_not_rendered_yet(self, test_prefs):
         """An unfinished rendition is still switchable - it's in the master playlist."""
         events = EventSystem()
         filename_fn = lambda x, remove_youtube_id=True: x
 
         pc = PlaybackController(test_prefs, events, filename_fn)
         pc._using_rendition_manager = True
-        pc.rendition_manager.is_in_window = MagicMock(return_value=True)
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
         pc.rendition_manager.is_rendered = MagicMock(return_value=False)
 
         assert pc.can_fast_switch(2) is True

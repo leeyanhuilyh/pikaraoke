@@ -6,6 +6,8 @@ import pytest
 
 from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.rendition_manager import (
+    MAX_SEMITONES,
+    MIN_SEMITONES,
     RenditionManager,
     audio_playlist_path,
     build_master_playlist,
@@ -73,15 +75,14 @@ class TestBuildMasterPlaylist:
         assert len(default_lines) == 1
         assert 'NAME="1"' in default_lines[0]
 
-    def test_p1_and_p12_uris_are_disambiguated(self):
-        # A segment-count marker collision (e.g. "p1" as a substring of
-        # "p12") would corrupt readiness detection - the playlist URIs
-        # themselves need to stay distinct too.
+    def test_every_pitch_gets_a_distinct_uri(self):
         fr = _make_mock_fr()
-        playlist = build_master_playlist(fr, [1, 12], base_semitones=1)
+        offsets = list(range(-6, 7))
+        playlist = build_master_playlist(fr, offsets, base_semitones=0)
 
-        assert 'URI="12345_audio_p1.m3u8"' in playlist
-        assert 'URI="12345_audio_p12.m3u8"' in playlist
+        uris = [line.split('URI="')[1] for line in playlist.splitlines() if 'URI="' in line]
+        assert len(uris) == len(offsets)
+        assert len(set(uris)) == len(offsets)
 
 
 class TestRenditionManagerStart:
@@ -122,9 +123,10 @@ class TestRenditionManagerStart:
     @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=True)
     @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
     @patch("pikaraoke.lib.rendition_manager.build_video_only_ffmpeg_cmd")
-    def test_window_computed_around_base_semitones(
+    def test_declares_the_full_range_regardless_of_the_window(
         self, mock_video_cmd, mock_audio_cmd, mock_ready, test_prefs, tmp_path
     ):
+        """Every supported pitch is switchable; the window is only a head start."""
         test_prefs.set("pitch_window_semitones", 2)
         mock_video_cmd.return_value.run_async.return_value = MagicMock()
         mock_audio_cmd.return_value.run_async.return_value = MagicMock()
@@ -132,17 +134,17 @@ class TestRenditionManagerStart:
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
 
         with patch.object(rm, "_render_remaining"):
-            rm.start(fr, base_semitones=5)
+            rm.start(fr, base_semitones=0)
 
+        assert rm._declared == list(range(MIN_SEMITONES, MAX_SEMITONES + 1))
         # Nearest-to-base first, so the pitches a singer is most likely to
-        # pick next become switchable soonest.
-        assert rm._pending == [4, 6, 3, 7]
-        assert rm._window == [3, 4, 5, 6, 7]
+        # step to next are ready soonest.
+        assert rm._pending == [-1, 1, -2, 2]
 
     @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=True)
     @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
     @patch("pikaraoke.lib.rendition_manager.build_video_only_ffmpeg_cmd")
-    def test_window_clamped_to_semitone_range(
+    def test_window_clamped_to_the_supported_range(
         self, mock_video_cmd, mock_audio_cmd, mock_ready, test_prefs, tmp_path
     ):
         test_prefs.set("pitch_window_semitones", 5)
@@ -152,10 +154,10 @@ class TestRenditionManagerStart:
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
 
         with patch.object(rm, "_render_remaining"):
-            rm.start(fr, base_semitones=10)
+            rm.start(fr, base_semitones=4)
 
-        assert max(rm._pending) == 12
-        assert min(rm._pending) == 5
+        assert max(rm._pending) == MAX_SEMITONES
+        assert min(rm._pending) == -1
 
 
 class TestRenditionManagerSequentialRendering:
@@ -238,29 +240,30 @@ class TestRenditionManagerSequentialRendering:
         assert rm._pending == [1, 2]
 
 
-class TestRenditionManagerInWindow:
-    """Tests for is_in_window, which decides switch vs restart."""
+class TestRenditionManagerIsSwitchable:
+    """Tests for is_switchable, which decides switch vs restart."""
 
-    def test_true_for_declared_window_pitch(self, test_prefs):
+    def test_true_for_a_declared_pitch(self, test_prefs):
         rm = RenditionManager(test_prefs)
-        rm._window = [-2, -1, 0, 1, 2]
+        rm._declared = [-2, -1, 0, 1, 2]
 
-        assert rm.is_in_window(2) is True
+        assert rm.is_switchable(2) is True
 
-    def test_true_even_when_not_yet_rendered(self, test_prefs):
-        """The master playlist already advertises it, so the player can switch."""
+    def test_true_even_when_not_rendered_or_pre_rendered(self, test_prefs):
+        """The master playlist advertises it, so the player can switch to it."""
         rm = RenditionManager(test_prefs)
-        rm._window = [-2, -1, 0, 1, 2]
+        rm._declared = [-2, -1, 0, 1, 2]
         rm._ready = {0}
+        rm._pending = []
 
-        assert rm.is_in_window(2) is True
+        assert rm.is_switchable(2) is True
         assert rm.is_rendered(2) is False
 
-    def test_false_outside_window(self, test_prefs):
+    def test_false_outside_the_declared_range(self, test_prefs):
         rm = RenditionManager(test_prefs)
-        rm._window = [-2, -1, 0, 1, 2]
+        rm._declared = [-2, -1, 0, 1, 2]
 
-        assert rm.is_in_window(7) is False
+        assert rm.is_switchable(7) is False
 
 
 class TestRenditionManagerEnsureSwitchable:
@@ -282,65 +285,77 @@ class TestRenditionManagerEnsureSwitchable:
         rm = RenditionManager(test_prefs)
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._fr = fr
-        rm._window = [0, 1, 2]
+        rm._declared = [0, 1, 2]
         rm._pending = [1, 2]
         self._write_rendition(tmp_path, fr, "p2", segments=3)
 
-        assert rm.ensure_switchable(2, position=0, timeout=1) is True
-        assert rm._pending[0] == 2
+        with patch.object(rm, "_launch_render"):
+            assert rm.ensure_switchable(2, position=0, timeout=1) is True
+
+    def test_starts_a_render_for_a_pitch_outside_the_pre_render_window(self, test_prefs, tmp_path):
+        """Nothing is queued for it, so waiting alone would never succeed."""
+        rm = RenditionManager(test_prefs)
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+        rm._fr = fr
+        rm._declared = [0, 1, 2, 5]
+        rm._pending = [1, 2]
+        self._write_rendition(tmp_path, fr, "p5", segments=3)
+
+        with patch.object(rm, "_launch_render") as mock_launch:
+            assert rm.ensure_switchable(5, position=0, timeout=1) is True
+
+        mock_launch.assert_called_once_with(fr, 5)
 
     def test_false_when_rendition_has_not_reached_the_playhead(self, test_prefs, tmp_path):
         """The opening being rendered is not enough to switch 60s into a song."""
         rm = RenditionManager(test_prefs)
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._fr = fr
-        rm._window = [0, 1, 2]
+        rm._declared = [0, 1, 2]
         rm._pending = [2]
         self._write_rendition(tmp_path, fr, "p2", segments=3)
 
-        assert rm.ensure_switchable(2, position=60, timeout=0.2) is False
+        with patch.object(rm, "_launch_render"):
+            assert rm.ensure_switchable(2, position=60, timeout=0.2) is False
 
     def test_true_when_rendition_covers_the_playhead(self, test_prefs, tmp_path):
         rm = RenditionManager(test_prefs)
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._fr = fr
-        rm._window = [0, 1, 2]
+        rm._declared = [0, 1, 2]
         rm._pending = [2]
         # 60s playhead + 6s lookahead over 3s segments needs 23 segments.
         self._write_rendition(tmp_path, fr, "p2", segments=23)
 
-        assert rm.ensure_switchable(2, position=60, timeout=1) is True
+        with patch.object(rm, "_launch_render"):
+            assert rm.ensure_switchable(2, position=60, timeout=1) is True
 
     def test_true_for_a_finished_rendition_near_the_end_of_a_song(self, test_prefs, tmp_path):
         """A completed render has no more segments coming, however late the playhead."""
         rm = RenditionManager(test_prefs)
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._fr = fr
-        rm._window = [0, 1, 2]
+        rm._declared = [0, 1, 2]
         self._write_rendition(tmp_path, fr, "p2", segments=4)
         finished = MagicMock()
         finished.poll.return_value = 0
         rm._audio_processes = {2: finished}
 
-        assert rm.ensure_switchable(2, position=200, timeout=1) is True
+        with patch.object(rm, "_launch_render"):
+            assert rm.ensure_switchable(2, position=200, timeout=1) is True
 
     def test_false_when_segments_never_appear(self, test_prefs, tmp_path):
         rm = RenditionManager(test_prefs)
         rm._fr = _make_mock_fr(tmp_dir=str(tmp_path))
-        rm._window = [0, 1, 2]
+        rm._declared = [0, 1, 2]
         rm._pending = [2]
 
-        assert rm.ensure_switchable(2, timeout=0.2) is False
+        with patch.object(rm, "_launch_render"):
+            assert rm.ensure_switchable(2, timeout=0.2) is False
 
 
 class TestRenditionManagerReadiness:
-    """Tests for rendered_semitones/is_rendered."""
-
-    def test_rendered_semitones_sorted(self, test_prefs):
-        rm = RenditionManager(test_prefs)
-        rm._ready = {0, 2, -2}
-
-        assert rm.rendered_semitones() == [-2, 0, 2]
+    """Tests for is_rendered."""
 
     def test_is_rendered(self, test_prefs):
         rm = RenditionManager(test_prefs)

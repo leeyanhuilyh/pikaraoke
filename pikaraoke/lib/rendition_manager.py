@@ -29,8 +29,13 @@ from pikaraoke.lib.url_prefix import normalize_url_base_path
 if TYPE_CHECKING:
     from pikaraoke.lib.file_resolver import FileResolver
 
-MIN_SEMITONES = -12
-MAX_SEMITONES = 12
+# Every rendition in this range is declared in the master playlist, so any
+# of them can be switched to without restarting - pre-rendering only
+# decides how fast that switch feels. +/-6 is what commercial karaoke
+# machines offer, and it already reaches every key: +6 and -6 are the same
+# pitch class an octave apart, so a wider range only adds shift artifacts.
+MIN_SEMITONES = -6
+MAX_SEMITONES = 6
 READY_POLL_INTERVAL_SECONDS = 0.05
 READY_TIMEOUT_SECONDS = 120
 MIN_READY_SEGMENTS = 3
@@ -140,7 +145,8 @@ class RenditionManager:
         self._video_process: subprocess.Popen | None = None
         self._audio_processes: dict[int, subprocess.Popen] = {}
         self._ready: set[int] = set()
-        self._window: list[int] = []
+        self._rendering: set[int] = set()
+        self._declared: list[int] = []
         self._pending: list[int] = []
         self._fr: "FileResolver | None" = None
         self._lock = Lock()
@@ -150,24 +156,20 @@ class RenditionManager:
     def _with_base_path(self, path: str) -> str:
         return f"{self.base_path}{path}" if self.base_path else path
 
-    def rendered_semitones(self) -> list[int]:
-        with self._lock:
-            return sorted(self._ready)
-
     def is_rendered(self, semitones: int) -> bool:
         with self._lock:
             return semitones in self._ready
 
-    def is_in_window(self, semitones: int) -> bool:
+    def is_switchable(self, semitones: int) -> bool:
         """Whether this pitch is declared in the current song's master playlist.
 
-        Every windowed rendition is advertised to the player up front, so
-        the browser can switch to any of them - whether or not its render
-        has finished. Only a pitch outside the window needs a new master
-        playlist, and therefore a restart.
+        Every supported pitch is advertised to the player up front, whether
+        or not it has been rendered yet, so the browser can switch to any
+        of them. Only a pitch outside the declared range would need a new
+        master playlist, and therefore a restart.
         """
         with self._lock:
-            return semitones in self._window
+            return semitones in self._declared
 
     def prioritize(self, semitones: int) -> None:
         """Move a queued pitch to the front so it renders next."""
@@ -193,10 +195,15 @@ class RenditionManager:
         writes it, so anything past the playhead is enough to switch on.
         """
         fr = self._fr
-        if fr is None or not self.is_in_window(semitones):
+        if fr is None or not self.is_switchable(semitones):
             return False
 
+        # Pre-rendering only covers a window around the starting key, so a
+        # pitch outside it has nothing running yet and nothing queued to
+        # wait for - start it here rather than leave the caller waiting on
+        # a render that would never happen.
         self.prioritize(semitones)
+        self._launch_render(fr, semitones)
         marker = f"{fr.stream_uid}_audio_{semitone_label(semitones)}_"
         playlist = audio_playlist_path(fr, semitones)
         needed = int((position + SWITCH_LOOKAHEAD_SECONDS) // HLS_SEGMENT_SECONDS) + 1
@@ -235,17 +242,18 @@ class RenditionManager:
 
         window = int(self.preferences.get_or_default("pitch_window_semitones"))
         cdg_pixel_scaling = self.preferences.get_or_default("cdg_pixel_scaling")
-        offsets = sorted(
-            {
-                s
-                for s in range(base_semitones - window, base_semitones + window + 1)
-                if MIN_SEMITONES <= s <= MAX_SEMITONES
-            }
-            | {base_semitones}
+        # Declared covers every supported pitch so none of them can force a
+        # restart. The window only decides which ones get rendered ahead of
+        # being asked for; the rest render on demand when picked.
+        declared = sorted({*range(MIN_SEMITONES, MAX_SEMITONES + 1), base_semitones})
+        prerendered = sorted(
+            s
+            for s in range(base_semitones - window, base_semitones + window + 1)
+            if MIN_SEMITONES <= s <= MAX_SEMITONES
         )
         with self._lock:
             self._fr = fr
-            self._window = list(offsets)
+            self._declared = declared
 
         video_cmd = build_video_only_ffmpeg_cmd(
             fr,
@@ -272,16 +280,16 @@ class RenditionManager:
 
         master_path = f"{fr.tmp_dir}/{fr.stream_uid}.m3u8"
         with open(master_path, "w") as f:
-            f.write(build_master_playlist(fr, offsets, base_semitones))
+            f.write(build_master_playlist(fr, declared, base_semitones))
 
-        # Nearest-to-base first: singers typically nudge the key by 1-2
-        # semitones at a time rather than jumping straight to the edge of
-        # the window, so the pitches most likely to be picked next become
-        # switchable soonest. A pitch the singer actually asks for jumps
-        # this queue (see prioritize).
+        # Nearest-to-base first: singers nudge the key a step at a time
+        # rather than jumping to the edge of the range, so the pitches most
+        # likely to be picked next are ready soonest. A pitch the singer
+        # actually asks for jumps this queue (see prioritize).
         with self._lock:
             self._pending = sorted(
-                (s for s in offsets if s != base_semitones), key=lambda s: abs(s - base_semitones)
+                (s for s in prerendered if s != base_semitones),
+                key=lambda s: abs(s - base_semitones),
             )
         self._bg_thread = Thread(
             target=self._render_remaining, args=(fr, base_semitones), daemon=True
@@ -299,8 +307,20 @@ class RenditionManager:
             duration=fr.duration,
         )
 
-    def _render_one(self, fr: "FileResolver", semitones: int) -> bool:
-        """Render one audio-only rendition to completion and mark it ready."""
+    def _launch_render(self, fr: "FileResolver", semitones: int) -> subprocess.Popen | None:
+        """Start one rendition's ffmpeg, unless it is already running.
+
+        Safe to call from both the background queue and an on-demand
+        switch, which can race for the same pitch.
+        """
+        with self._lock:
+            existing = self._audio_processes.get(semitones)
+            if semitones in self._rendering and existing is not None:
+                return existing
+            self._rendering.add(semitones)
+            if semitones in self._pending:
+                self._pending.remove(semitones)
+
         normalize_audio = self.preferences.get_or_default("normalize_audio")
         avsync = self.preferences.get_or_default("avsync")
         label = semitone_label(semitones)
@@ -316,6 +336,14 @@ class RenditionManager:
         proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
         with self._lock:
             self._audio_processes[semitones] = proc
+        return proc
+
+    def _render_one(self, fr: "FileResolver", semitones: int) -> bool:
+        """Render one audio-only rendition and mark it ready to play from."""
+        label = semitone_label(semitones)
+        proc = self._launch_render(fr, semitones)
+        if proc is None:
+            return False
         ready = _wait_until_ready(
             fr.tmp_dir,
             f"{fr.stream_uid}_audio_{label}_",
@@ -364,7 +392,8 @@ class RenditionManager:
             audio_processes = list(self._audio_processes.values())
             self._audio_processes.clear()
             self._ready.clear()
-            self._window = []
+            self._rendering.clear()
+            self._declared = []
             self._pending = []
             self._fr = None
             video_process = self._video_process
