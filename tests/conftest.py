@@ -129,6 +129,9 @@ class MockPlaybackController:
             return True
         return False
 
+    def prepare_pitch_switch(self, semitones: int) -> bool:
+        return True
+
     def reset_now_playing(self) -> None:
         self.now_playing = None
         self.now_playing_filename = None
@@ -282,6 +285,7 @@ class MockKaraoke:
     rename_song = Karaoke.rename_song
     reset_now_playing = Karaoke.reset_now_playing
     transpose_current = Karaoke.transpose_current
+    fast_transpose = Karaoke.fast_transpose
     send_notification = Karaoke.send_notification
     log_and_send = Karaoke.log_and_send
     update_now_playing_socket = Karaoke.update_now_playing_socket

@@ -714,6 +714,15 @@
 					</label>
 					</div>
 
+					{% if is_transpose_enabled %}
+					<div class="user-preference-container is-align-items-center">
+					<input id="pref-pitch-window-semitones" class="user-preference-input input" type="number" min="0" max="12" data-pref="pitch_window_semitones" data-start-value="{{ pitch_window_semitones }}" value="{{ pitch_window_semitones }}" />
+					<label class="label" for="pref-pitch-window-semitones">
+							{# MSG: Numberbox label for the pitch pre-rendering window #} {% trans %}Semitones on each side of the current key to pre-render for instant key changes (0 = disabled, restarts the song on every key change instead){% endtrans %}
+					</label>
+					</div>
+					{% endif %}
+
 					<div class="user-preference-container is-align-items-center">
 					<input id="pref-limit-user-songs-by" class="user-preference-input input" type="number" min="0" max="99" data-pref="limit_user_songs_by" data-start-value="{{ limit_user_songs_by }}" value="{{ limit_user_songs_by }}" />
 					<label class="label" for="pref-limit-user-songs-by">

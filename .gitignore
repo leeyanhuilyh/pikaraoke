@@ -25,3 +25,7 @@ docker-compose.yml
 
 # Script output
 scripts/itunes_report.csv
+
+# Throwaway feasibility prototype for HLS audio-rendition switching.
+# Delete once the pitch pre-render feature is stable.
+scripts/prototypes/audio-track-switch-poc/

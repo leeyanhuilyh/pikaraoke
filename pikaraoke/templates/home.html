@@ -7,6 +7,33 @@
 		window.socket = io({ path: window.pikaraokeConfig.socketioPath });
 	}
 
+	function renderTransposeQuickSelect(np) {
+		// Quick-select buttons for pitches that are already pre-rendered
+		// (rendition pre-caching, when enabled): clicking one switches the
+		// audio rendition instantly instead of restarting the song. Pitches
+		// outside the pre-rendered window still go through the slider below.
+		var container = $("#transpose-quick-select");
+		if (!container.length) return;
+		var semitones = np.rendered_semitones || [];
+		container.empty();
+		if (semitones.length === 0) {
+			container.hide();
+			return;
+		}
+		container.show();
+		semitones.forEach(function (s) {
+			var isActive = s === np.now_playing_transpose;
+			$("<button>")
+				.addClass("button is-rounded is-small")
+				.addClass(isActive ? "is-success" : "")
+				.text(getSemitonesLabel(s))
+				.on("click", function () {
+					$.post(window.pikaraokeConfig.basePath + "/transpose/" + s);
+				})
+				.appendTo(container);
+		});
+	}
+
 	function loadNowPlaying() {
 		console.log("Loading now playing data");
 		$.get('{{ url_for("now_playing.now_playing") }}', function (data) {
@@ -53,6 +80,8 @@
 			$("#transpose").val(0);
 			$("#semitones-label").html(getSemitonesLabel(np.now_playing_transpose));
 		}
+
+		renderTransposeQuickSelect(np);
 
 		// set the volume slider to the current volume
 		if (np.volume != volume) {
@@ -277,6 +306,7 @@
 	<hr />
 
 	{% if is_transpose_enabled %}
+	<div id="transpose-quick-select" class="is-flex" style="flex-wrap: wrap; gap: 4px; margin-bottom: 8px; display: none"></div>
 	<div class="is-flex" style="justify-content: space-between">
 		<div>
 			{# MSG: Title of a control to change the key/pitch of the playing song. #}

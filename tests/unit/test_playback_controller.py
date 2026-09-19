@@ -281,6 +281,25 @@ class TestPlaybackControllerEndSong:
 
         assert emitted_reasons == ["complete"]
 
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    @patch("pikaraoke.lib.playback_controller.delete_tmp_dir")
+    def test_end_song_kills_rendition_manager_when_active(
+        self, mock_delete, mock_sleep, test_prefs
+    ):
+        """A song played via pre-rendering must tear down all its processes, not just one."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.kill_all = MagicMock()
+        pc.stream_manager.kill_ffmpeg = MagicMock()
+
+        pc.end_song()
+
+        pc.rendition_manager.kill_all.assert_called_once()
+        pc.stream_manager.kill_ffmpeg.assert_not_called()
+
 
 class TestPlaybackControllerSkip:
     """Tests for PlaybackController.skip method."""
@@ -371,6 +390,132 @@ class TestPlaybackControllerGetNowPlaying:
         assert state["now_playing_user"] == "TestUser"
         assert state["now_playing_transpose"] == 2
         assert state["is_paused"] is False
+
+    def test_rendered_semitones_empty_when_rendition_manager_not_active(self, test_prefs):
+        """No pre-rendering happened for this song - nothing to offer as a fast switch."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+
+        assert pc.get_now_playing()["rendered_semitones"] == []
+
+    def test_rendered_semitones_reflects_rendition_manager_when_active(self, test_prefs):
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.rendered_semitones = MagicMock(return_value=[-2, 0, 2])
+
+        assert pc.get_now_playing()["rendered_semitones"] == [-2, 0, 2]
+
+
+class TestPlaybackControllerCanFastSwitch:
+    """Tests for PlaybackController.can_fast_switch."""
+
+    def test_false_when_rendition_manager_not_active(self, test_prefs):
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc.rendition_manager.is_in_window = MagicMock(return_value=True)
+
+        assert pc.can_fast_switch(2) is False
+
+    def test_false_outside_the_window(self, test_prefs):
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.is_in_window = MagicMock(return_value=False)
+
+        assert pc.can_fast_switch(7) is False
+
+    def test_true_for_a_windowed_pitch_that_is_not_rendered_yet(self, test_prefs):
+        """An unfinished rendition is still switchable - it's in the master playlist."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.is_in_window = MagicMock(return_value=True)
+        pc.rendition_manager.is_rendered = MagicMock(return_value=False)
+
+        assert pc.can_fast_switch(2) is True
+
+
+class TestPlaybackControllerPlayFileRenditionManager:
+    """Tests for the RenditionManager branch of PlaybackController.play_file."""
+
+    @patch("pikaraoke.lib.playback_controller.os.path.isfile", return_value=True)
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    def test_uses_rendition_manager_when_enabled_and_supported(
+        self, mock_sleep, mock_isfile, test_prefs
+    ):
+        test_prefs.set("pitch_window_semitones", 3)
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: "Test Song"
+
+        pc = PlaybackController(
+            test_prefs, events, filename_fn, streaming_format="hls", is_transpose_enabled=True
+        )
+        mock_result = PlaybackResult(success=True, stream_url="/stream/123.m3u8", duration=180)
+        pc.rendition_manager.start = MagicMock(return_value=mock_result)
+        pc.stream_manager.play_file = MagicMock()
+        pc.is_playing = True
+
+        result = pc.play_file("/songs/test.mp4", "TestUser", semitones=2)
+
+        assert result.success is True
+        pc.rendition_manager.start.assert_called_once()
+        pc.stream_manager.play_file.assert_not_called()
+        assert pc._using_rendition_manager is True
+
+    @patch("pikaraoke.lib.playback_controller.os.path.isfile", return_value=True)
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    def test_falls_back_to_stream_manager_when_window_is_zero(
+        self, mock_sleep, mock_isfile, test_prefs
+    ):
+        test_prefs.set("pitch_window_semitones", 0)
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: "Test Song"
+
+        pc = PlaybackController(
+            test_prefs, events, filename_fn, streaming_format="hls", is_transpose_enabled=True
+        )
+        mock_result = PlaybackResult(success=True, stream_url="/stream/123.m3u8", duration=180)
+        pc.stream_manager.play_file = MagicMock(return_value=mock_result)
+        pc.rendition_manager.start = MagicMock()
+        pc.is_playing = True
+
+        result = pc.play_file("/songs/test.mp4", "TestUser", semitones=2)
+
+        assert result.success is True
+        pc.stream_manager.play_file.assert_called_once()
+        pc.rendition_manager.start.assert_not_called()
+        assert pc._using_rendition_manager is False
+
+    @patch("pikaraoke.lib.playback_controller.os.path.isfile", return_value=True)
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    def test_falls_back_when_rubberband_unavailable(self, mock_sleep, mock_isfile, test_prefs):
+        test_prefs.set("pitch_window_semitones", 3)
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: "Test Song"
+
+        pc = PlaybackController(
+            test_prefs, events, filename_fn, streaming_format="hls", is_transpose_enabled=False
+        )
+        mock_result = PlaybackResult(success=True, stream_url="/stream/123.m3u8", duration=180)
+        pc.stream_manager.play_file = MagicMock(return_value=mock_result)
+        pc.rendition_manager.start = MagicMock()
+        pc.is_playing = True
+
+        pc.play_file("/songs/test.mp4", "TestUser", semitones=2)
+
+        pc.stream_manager.play_file.assert_called_once()
+        pc.rendition_manager.start.assert_not_called()
 
 
 class TestPlaybackControllerResetNowPlaying:

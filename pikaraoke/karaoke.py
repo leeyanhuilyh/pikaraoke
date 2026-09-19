@@ -130,6 +130,7 @@ class Karaoke:
         keep_awake: bool | None = None,
         limit_user_songs_by: int | None = None,
         normalize_audio: bool | None = None,
+        pitch_window_semitones: int | None = None,
         screensaver_timeout: int | None = None,
         show_splash_clock: bool | None = None,
         splash_delay: int | None = None,
@@ -169,6 +170,9 @@ class Karaoke:
             disable_score: Disable score screen.
             limit_user_songs_by: Max songs per user in queue (0 = unlimited).
             avsync: Audio/video sync adjustment in seconds.
+            pitch_window_semitones: Semitones on each side of the current key
+                to pre-render in the background for instant pitch switching
+                (0 disables pre-rendering).
             config_file_path: Path to config.ini file.
             cdg_pixel_scaling: Enable CDG pixel scaling.
             streaming_format: Video streaming format ('hls' or 'mp4').
@@ -257,6 +261,7 @@ class Karaoke:
             filename_from_path=self.song_manager.display_name_from_path,
             streaming_format=self.streaming_format,
             base_path=self.url_base_path,
+            is_transpose_enabled=self.is_transpose_enabled,
         )
 
         # Event bridging: the coordinator wires manager events to the UI (SocketIO/notifications).
@@ -559,6 +564,24 @@ class Karaoke:
         # MSG: Message shown after the song is transposed, first is the semitones and then the song name
         self.log_and_send(_("Transposing by %s semitones: %s") % (semitones, now_playing))
         self.playback_controller.skip(log_action=False, reason="transpose")
+
+    def fast_transpose(self, semitones: int) -> None:
+        """Switch to an already pre-rendered pitch without restarting playback.
+
+        Args:
+            semitones: Number of semitones to transpose. Must be inside the
+                current song's pre-render window - callers should check
+                playback_controller.can_fast_switch(semitones) first.
+        """
+        # Renders it next if it hasn't been reached yet. Even if this times
+        # out we still switch rather than restart: the player polls the
+        # rendition's playlist as it grows.
+        if not self.playback_controller.prepare_pitch_switch(semitones):
+            logging.debug(f"Pitch {semitones} not fully buffered yet, switching anyway")
+        self.playback_controller.now_playing_transpose = semitones
+        # MSG: Message shown after a key change that didn't need to restart the song
+        self.log_and_send(_("Changed key to %s semitones") % semitones)
+        self.events.emit("now_playing_update")
 
     def volume_change(self, vol_level: float) -> bool:
         """Set the volume level.
