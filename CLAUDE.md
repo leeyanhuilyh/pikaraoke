@@ -86,4 +86,4 @@ PRs must include a test plan: a minimal checklist targeting only the changes mad
 
 ## Features to add (leeyanhuilyh fork)
 
-Refer to dev-requirements.md for the features to be added by leeyanhuilyh. That document will contain features planned, user stories, requirements, and progress for each feature. This repo is forked from v1.23.0 (commit ded036a) of the publicly released PiKaraoke. leeyanhuilyh fork versions will follow the convention v1.23.0+yh.N, where N is an incrementing version number. When updating the progress for each feature, keep the write-up concise, it should only be at max 1 paragraph.
+Refer to .claude/requirements.md for the features to be added by leeyanhuilyh. That document will contain features planned, user stories, requirements, and progress for each feature. This repo is forked from v1.23.0 (commit ded036a) of the publicly released PiKaraoke. leeyanhuilyh fork versions will follow the convention v1.23.0+yh.N, where N is an incrementing version number. When updating the progress for each feature, keep the write-up concise, it should only be at max 1 paragraph.
