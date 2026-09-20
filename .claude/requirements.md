@@ -8,6 +8,7 @@
 - User able to see current pitch relative to song's base pitch
 
 #### Functional requirements
+
 - Pitch change should be seamless (video continues playing, audio continues from where pitch change occurred)
 - Pitch change should take no more than 5 seconds
 
@@ -53,6 +54,7 @@ Implements vocal reduction via ffmpeg's stereotools center-channel-cancellation 
 - Lyrics should show up on the left and right of the screen, similar to how it is in karaoke screens
 
 #### Functional requirements
+
 - Lyrics display should be synced up to when the singer actually starts singing
 - If lyrics file doesn't exist in local database, it needs to be fetched and synced up to the track
 
