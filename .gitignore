@@ -13,7 +13,8 @@ qrcode.png
 docker-compose.yml
 /.idea/
 .coverage
-.claude/
+.claude/*
+!.claude/requirements.md
 /logs
 
 # Compiled translation files (generated from .po files at startup)
