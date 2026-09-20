@@ -14,8 +14,13 @@ let isScoreShown = false;
 const hasBgVideo = PikaraokeConfig.hasBgVideo;
 let currentVideoUrl = null;
 let hlsInstance = null;
-let currentTranspose = 0;
+// The audio rendition currently selected, as "<semitones>:<on|off>" - the same
+// form the server names its HLS audio tracks, so a track is found by this key.
+let currentAudioTrack = "0:on";
 let audioTrackMap = {};
+
+const audioTrackKey = (np) =>
+  `${np.now_playing_transpose}:${np.now_playing_vocals === false ? "off" : "on"}`;
 let idleTime = 0;
 let screensaverTimeoutSeconds = PikaraokeConfig.screensaverTimeout;
 let bg_playlist = [];
@@ -112,7 +117,7 @@ const endSong = async (reason = null, showScore = false) => {
     isScoreShown = false;
   }
   currentVideoUrl = null;
-  currentTranspose = 0;
+  currentAudioTrack = "0:on";
   audioTrackMap = {};
   if (hlsInstance) {
     hlsInstance.destroy();
@@ -272,12 +277,21 @@ const renderSessionName = () => {
     .toggle(Boolean(sessionName) && !PikaraokeConfig.hideSessionName);
 };
 
+const renderSeparating = (title) => {
+  if (title) {
+    $("#separating-label").text(PikaraokeConfig.translations.separatingVocals);
+    $("#separating-song").text(title);
+  }
+  $("#separating").toggle(Boolean(title));
+};
+
 const handleNowPlayingUpdate = (np) => {
   nowPlaying = np;
   if (np.session_name !== sessionName) {
     sessionName = np.session_name;
     renderSessionName();
   }
+  renderSeparating(np.separating);
   if (np.now_playing) {
 
     // Handle updating now playing HTML
@@ -339,7 +353,7 @@ const handleNowPlayingUpdate = (np) => {
 
   if (np.now_playing_url && np.now_playing_url !== currentVideoUrl) {
     currentVideoUrl = np.now_playing_url;
-    currentTranspose = np.now_playing_transpose;
+    currentAudioTrack = audioTrackKey(np);
     const streamUrl = np.now_playing_url;
     $("#video-source").attr("src", "");
     video.load();
@@ -353,14 +367,13 @@ const handleNowPlayingUpdate = (np) => {
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
         audioTrackMap = {};
         hlsInstance = new Hls({ startPosition: 0 });
-        // Alternate audio renditions (pre-rendered pitch tracks, if any) are
-        // resolved asynchronously after the manifest parses - build the
-        // semitone -> track-index map once they're known.
+        // Alternate audio renditions (pre-rendered pitch and vocals tracks, if
+        // any) are resolved asynchronously after the manifest parses - build
+        // the track name -> track-index map once they're known.
         hlsInstance.on(Hls.Events.AUDIO_TRACKS_UPDATED, (event, data) => {
           audioTrackMap = {};
           data.audioTracks.forEach((track, idx) => {
-            const semitones = parseInt(track.name, 10);
-            if (!Number.isNaN(semitones)) audioTrackMap[semitones] = idx;
+            audioTrackMap[track.name] = idx;
           });
         });
         hlsInstance.loadSource(streamUrl);
@@ -402,13 +415,13 @@ const handleNowPlayingUpdate = (np) => {
         endSong("failed to start");
       }
     }, playbackStartTimeout);
-  } else if (np.now_playing_url && np.now_playing_transpose !== currentTranspose) {
-    // Same stream, pitch changed to an already pre-rendered semitone -
-    // switch the HLS audio rendition instead of reloading (near-instant,
-    // no video interruption).
-    currentTranspose = np.now_playing_transpose;
-    if (hlsInstance && audioTrackMap.hasOwnProperty(currentTranspose)) {
-      hlsInstance.audioTrack = audioTrackMap[currentTranspose];
+  } else if (np.now_playing_url && audioTrackKey(np) !== currentAudioTrack) {
+    // Same stream, pitch or vocals changed to an already pre-rendered
+    // rendition - switch the HLS audio track instead of reloading
+    // (near-instant, no video interruption).
+    currentAudioTrack = audioTrackKey(np);
+    if (hlsInstance && audioTrackMap.hasOwnProperty(currentAudioTrack)) {
+      hlsInstance.audioTrack = audioTrackMap[currentAudioTrack];
     }
   }
 }

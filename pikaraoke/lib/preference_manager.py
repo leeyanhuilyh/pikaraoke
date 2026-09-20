@@ -44,6 +44,14 @@ class PreferenceManager:
         # Semitones on each side of the current key to pre-render in the
         # background for instant pitch switching. 0 disables pre-rendering.
         "pitch_window_semitones": 0,
+        # Demucs vocal separation for downloaded songs: "off", "background"
+        # (queue the song immediately, separate while it waits) or
+        # "before_play" (separate first, so vocals can be off from the start).
+        "vocal_separation": "off",
+        # Device demucs runs inference on: "auto" (CUDA or MPS when present,
+        # else CPU), or "cpu"/"cuda" to pin it. A CUDA build runs CPU inference
+        # fine, so switching is a setting, not a reinstall.
+        "vocal_separation_device": "auto",
         "browse_results_per_page": 100,
         "low_score_phrases": "",
         "mid_score_phrases": "",

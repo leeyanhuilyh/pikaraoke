@@ -6,6 +6,11 @@ import threading
 import unicodedata
 from collections.abc import Iterator
 
+# Cached separated stems live here, inside the songs directory so they travel
+# with the library, in a dot-directory the scanner skips: they are .mp3 files
+# and would otherwise be indexed as songs of their own.
+STEMS_DIR_NAME = ".stems"
+
 
 class SongList:
     """A hybrid data structure for efficient song list management.

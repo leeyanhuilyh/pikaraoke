@@ -22,6 +22,8 @@
     hideSessionName: "{{ hide_session_name }}" == 'True',
     translations: {
       socketConnectionLost: {{ _('Connection lost. Is the server still running?') | tojson }},
+      // {# MSG: Splash screen message while Demucs removes the vocals from the next song, followed by the song name. #}
+      separatingVocals: {{ _('Separating vocals') | tojson }},
       unsupportedBrowser: {{ _('This browser is not fully supported. You may experience streaming issues. Please use Chrome/Safari/Firefox/Edge for best results.') | tojson }},
     },
     scorePhrasesUrl: "{{ url_for('splash.get_score_phrases') }}",
@@ -60,6 +62,10 @@
     {% set session_name = active_session_name() %}
     <div id="session-name" class="stroke"
       {% if hide_session_name or not session_name %}style="display: none"{% endif %}>{{ session_name or '' }}</div>
+    <div id="separating" class="stroke" style="display: none">
+      <div id="separating-label"></div>
+      <div id="separating-song"></div>
+    </div>
   </div>
 </div>
 
@@ -304,6 +310,25 @@
     text-align: center;
     text-transform: uppercase;
     overflow-wrap: anywhere;
+  }
+  /* Shown between songs while playback waits on the vocal separation, so it
+     reads as the reason for the pause rather than a stall. */
+  #separating {
+    margin-top: 28px;
+    color: white;
+    text-align: center;
+    overflow-wrap: anywhere;
+  }
+  #separating-label {
+    font-size: 1.5rem;
+    font-weight: 300;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+  #separating-song {
+    margin-top: 6px;
+    font-size: 1.1rem;
+    opacity: 0.8;
   }
   #menu-background {
     bottom: 0;

@@ -165,6 +165,7 @@ class QueueManager:
                 self.queue.append(queue_item)
         self._events.emit("queue_update")
         self._events.emit("now_playing_update")
+        self._events.emit("song_enqueued", song_path)
         return [
             True,
             _("Song added to the queue: %s") % title,

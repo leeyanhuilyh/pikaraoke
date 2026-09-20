@@ -35,7 +35,7 @@ def make_request(
 @pytest.fixture(autouse=True)
 def no_reprioritize():
     """Keep psutil away from whatever pid a mocked Popen invents."""
-    with patch("pikaraoke.lib.download_manager._use_spare_capacity"):
+    with patch("pikaraoke.lib.download_manager.use_spare_capacity"):
         yield
 
 
@@ -824,3 +824,82 @@ class TestDownloadManagerSpecialCharacters:
         )
 
         queue_manager.enqueue.assert_called_once_with(file_path, "TestUser", log_action=False)
+
+
+class TestVocalSeparationHandoff:
+    """How a finished download reaches the vocal separator, per mode."""
+
+    @pytest.fixture
+    def separator(self):
+        return MagicMock()
+
+    @pytest.fixture
+    def manager(self, events, preferences, song_manager, queue_manager, separator):
+        return DownloadManager(
+            events=events,
+            preferences=preferences,
+            song_manager=song_manager,
+            queue_manager=queue_manager,
+            download_path="/songs",
+            vocal_separator=separator,
+        )
+
+    @staticmethod
+    def run_download(manager, song_manager, mode, separator):
+        separator.mode = mode
+        song_manager.songs.find_by_id.return_value = "/songs/Song---dQw4w9WgXcQ.mp4"
+        process = MagicMock()
+        process.stdout.readline.side_effect = ["Starting download...", ""]
+        process.poll.return_value = 0
+        with patch("flask_babel._", side_effect=lambda x: x):
+            with patch("subprocess.Popen", return_value=process):
+                with patch(
+                    "pikaraoke.lib.download_manager.build_ytdl_download_command",
+                    return_value=["yt-dlp", "url"],
+                ):
+                    manager._execute_download(make_request(enqueue=True, user="TestUser"))
+
+    def test_off_never_separates(self, manager, song_manager, separator):
+        self.run_download(manager, song_manager, "off", separator)
+        separator.queue_separation.assert_not_called()
+        separator.separate.assert_not_called()
+
+    def test_background_queues_without_blocking_the_download(
+        self, manager, song_manager, separator
+    ):
+        self.run_download(manager, song_manager, "background", separator)
+        separator.queue_separation.assert_called_once_with("/songs/Song---dQw4w9WgXcQ.mp4")
+        separator.separate.assert_not_called()
+
+    def test_before_play_separates_inline(self, manager, song_manager, separator):
+        self.run_download(manager, song_manager, "before_play", separator)
+        separator.separate.assert_called_once_with("/songs/Song---dQw4w9WgXcQ.mp4")
+        separator.queue_separation.assert_not_called()
+
+    def test_before_play_separates_ahead_of_the_playback_queue(
+        self, manager, song_manager, queue_manager, separator
+    ):
+        """The point of the mode: vocals-off must exist before the song can play."""
+        order = []
+        separator.mode = "before_play"
+        separator.separate.side_effect = lambda path: order.append("separate")
+        queue_manager.enqueue.side_effect = lambda *a, **kw: order.append("enqueue")
+        self.run_download(manager, song_manager, "before_play", separator)
+        assert order == ["separate", "enqueue"]
+
+    def test_a_download_without_a_separator_still_completes(
+        self, download_manager, song_manager, queue_manager
+    ):
+        """vocal_separator is optional, so the default manager must not trip over it."""
+        song_manager.songs.find_by_id.return_value = "/songs/Song---dQw4w9WgXcQ.mp4"
+        process = MagicMock()
+        process.stdout.readline.side_effect = ["Starting download...", ""]
+        process.poll.return_value = 0
+        with patch("flask_babel._", side_effect=lambda x: x):
+            with patch("subprocess.Popen", return_value=process):
+                with patch(
+                    "pikaraoke.lib.download_manager.build_ytdl_download_command",
+                    return_value=["yt-dlp", "url"],
+                ):
+                    assert download_manager._execute_download(make_request(enqueue=True)) == 0
+        queue_manager.enqueue.assert_called_once()

@@ -3,11 +3,8 @@
 import pytest
 
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
-from pikaraoke.lib.library_scanner import (
-    LibraryScanner,
-    _extract_youtube_id,
-    build_song_record,
-)
+from pikaraoke.lib.library_scanner import LibraryScanner, build_song_record
+from pikaraoke.lib.song_list import STEMS_DIR_NAME
 
 
 @pytest.fixture
@@ -73,6 +70,16 @@ class TestScanAddsFiles:
         _make_song(subdir, "Song---aaaaaaaaaaa.mp4")
         result = scanner.scan(str(tmp_path))
         assert result.added == 1
+
+    def test_ignores_cached_separated_stems(self, scanner, db, tmp_path):
+        """Stems are .mp3 files under the songs directory, and are not songs."""
+        _make_song(tmp_path, "Song---aaaaaaaaaaa.mp4")
+        stems = tmp_path / STEMS_DIR_NAME
+        stems.mkdir()
+        _make_song(stems, "aaaaaaaaaaa.no_vocals.mp3")
+        result = scanner.scan(str(tmp_path))
+        assert result.added == 1
+        assert db.get_song_count() == 1
 
 
 class TestScanDeletesFiles:
@@ -369,19 +376,3 @@ class TestBuildSongRecord:
         # Pass a fake directory listing with a .cdg companion
         record = build_song_record(str(mp3), files_in_dir={"Track.cdg", "Track.mp3"})
         assert record["format"] == "cdg"
-
-
-class TestExtractYoutubeId:
-    def test_pikaraoke_format(self):
-        assert _extract_youtube_id("Song---dQw4w9WgXcQ.mp4") == "dQw4w9WgXcQ"
-
-    def test_ytdlp_format(self):
-        assert _extract_youtube_id("Song [dQw4w9WgXcQ].mp4") == "dQw4w9WgXcQ"
-
-    def test_no_id(self):
-        assert _extract_youtube_id("Just A Song.mp4") is None
-
-    def test_pikaraoke_preferred_over_ytdlp(self):
-        # PiKaraoke format takes priority
-        result = _extract_youtube_id("Song [AAAAAAAAAAA]---BBBBBBBBBBB.mp4")
-        assert result == "BBBBBBBBBBB"

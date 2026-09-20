@@ -26,6 +26,23 @@
 		$.post(window.pikaraokeConfig.basePath + "/transpose/" + target);
 	}
 
+	var currentVocals = true;
+	// {# MSG: Label on the button showing the singer's vocals are playing on the backing track. Pressing it turns them off. #}
+	var vocalsOnLabel = {{ _('Vocals: On') | tojson }};
+	// {# MSG: Label on the button showing the singer's vocals are turned off. Pressing it turns them back on. #}
+	var vocalsOffLabel = {{ _('Vocals: Off') | tojson }};
+
+	function renderVocals(np) {
+		currentVocals = np.now_playing_vocals !== false;
+		$("#vocals-toggle")
+			.text(currentVocals ? vocalsOnLabel : vocalsOffLabel)
+			.toggleClass("is-success", currentVocals)
+			.prop("disabled", !np.vocals_switchable);
+		// The track is made in the background, so this is the button's normal
+		// state for a while after a new song starts, not an error.
+		$("#vocals-hint").toggle(!np.vocals_switchable && currentVocals);
+	}
+
 	function loadNowPlaying() {
 		console.log("Loading now playing data");
 		$.get('{{ url_for("now_playing.now_playing") }}', function (data) {
@@ -67,6 +84,7 @@
 
 		currentTranspose = np.now_playing_transpose || 0;
 		renderTranspose();
+		renderVocals(np);
 
 		// set the volume slider to the current volume
 		if (np.volume != volume) {
@@ -109,6 +127,10 @@
 
 		$("#transpose-reset").click(function () {
 			setTranspose(0);
+		});
+
+		$("#vocals-toggle").click(function () {
+			$.post(window.pikaraokeConfig.basePath + "/vocals/" + (currentVocals ? "off" : "on"));
 		});
 
 		$("#pause-resume").click(function () {
@@ -300,6 +322,17 @@
 			{% trans %}Original Key{% endtrans %}
 		</button>
 	</div>
+	{% endif %}
+
+	{% if vocal_separation_enabled %}
+	<hr />
+	<div class="is-flex" style="align-items: center; justify-content: space-between">
+		{# MSG: Title of a control to switch the singer's vocals on or off on the playing song. #}
+		<h4 style="margin: 0">{% trans %}Vocals{% endtrans %}</h4>
+		<button id="vocals-toggle" class="button is-rounded" disabled></button>
+	</div>
+	{# MSG: Hint under the vocals button while the song's vocals are still being separated from the music. #}
+	<p id="vocals-hint" class="is-size-7" style="display: none">{% trans %}Separating vocals, available shortly...{% endtrans %}</p>
 	{% endif %}
 
 	{% if mic_available %}

@@ -12,9 +12,12 @@ from pikaraoke.lib.file_resolver import FileResolver, delete_tmp_dir
 from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.rendition_manager import RenditionManager
 from pikaraoke.lib.stream_manager import PlaybackResult, StreamManager
+from pikaraoke.lib.vocal_separator import OFF
 
 if TYPE_CHECKING:
     import subprocess
+
+    from pikaraoke.lib.vocal_separator import VocalSeparator
 
 
 class PlaybackController:
@@ -28,6 +31,7 @@ class PlaybackController:
         now_playing_filename: File path of the currently playing song.
         now_playing_user: User who queued the current song.
         now_playing_transpose: Semitones to transpose current song.
+        now_playing_vocals: Whether the current song is playing with its vocals.
         now_playing_duration: Duration of current song in seconds.
         now_playing_url: Stream URL for current song.
         now_playing_subtitle_url: URL path for subtitles.
@@ -41,6 +45,7 @@ class PlaybackController:
     now_playing_filename: str | None = None
     now_playing_user: str | None = None
     now_playing_transpose: int = 0
+    now_playing_vocals: bool = True
     now_playing_duration: int | None = None
     now_playing_url: str | None = None
     now_playing_subtitle_url: str | None = None
@@ -56,6 +61,7 @@ class PlaybackController:
         streaming_format: str = "hls",
         base_path: str = "",
         is_transpose_enabled: bool = False,
+        vocal_separator: "VocalSeparator | None" = None,
     ) -> None:
         """Initialize the playback controller.
 
@@ -67,13 +73,16 @@ class PlaybackController:
             base_path: URL path prefix when PiKaraoke is hosted under a subpath.
             is_transpose_enabled: Whether ffmpeg has the rubberband filter,
                 gating whether pitch pre-rendering can be used at all.
+            vocal_separator: Source of each song's vocals-removed track, which
+                is what makes switching vocals off possible.
         """
         self.preferences = preferences
         self.events = events
         self.filename_from_path = filename_from_path
         self.is_transpose_enabled = is_transpose_enabled
         self.stream_manager = StreamManager(preferences, streaming_format, base_path)
-        self.rendition_manager = RenditionManager(preferences, base_path)
+        self._vocal_separator = vocal_separator
+        self.rendition_manager = RenditionManager(preferences, base_path, vocal_separator)
         self._using_rendition_manager = False
 
     @property
@@ -106,10 +115,15 @@ class PlaybackController:
 
         self.claim(file_path)
 
-        use_rendition_manager = (
-            self.stream_manager.streaming_format == "hls"
-            and self.is_transpose_enabled
+        # Switching vocals needs the same alternate-audio machinery as switching
+        # pitch, so either feature being on is enough to use it.
+        pitch_switching = (
+            self.is_transpose_enabled
             and int(self.preferences.get_or_default("pitch_window_semitones")) > 0
+        )
+        vocal_switching = self._vocal_separator is not None and self._vocal_separator.mode != OFF
+        use_rendition_manager = self.stream_manager.streaming_format == "hls" and (
+            pitch_switching or vocal_switching
         )
         if use_rendition_manager:
             try:
@@ -119,7 +133,7 @@ class PlaybackController:
                 logging.error(error_message)
                 result = PlaybackResult(success=False, error=error_message)
             else:
-                result = self.rendition_manager.start(fr, semitones)
+                result = self.rendition_manager.start(fr, semitones, file_path)
             self._using_rendition_manager = True
         else:
             result = self.stream_manager.play_file(file_path, semitones)
@@ -132,6 +146,7 @@ class PlaybackController:
         self.now_playing = self.filename_from_path(file_path, remove_youtube_id=True)
         self.now_playing_user = user
         self.now_playing_transpose = semitones
+        self.now_playing_vocals = True
         self.now_playing_duration = result.duration
         self.now_playing_url = result.stream_url
         self.now_playing_subtitle_url = result.subtitle_url
@@ -255,10 +270,24 @@ class PlaybackController:
             switched to while it is still writing. Only a pitch outside the
             declared range needs a new playlist, and therefore a restart.
         """
-        return self._using_rendition_manager and self.rendition_manager.is_switchable(semitones)
+        return self._using_rendition_manager and self.rendition_manager.is_switchable(
+            semitones, self.now_playing_vocals
+        )
 
-    def prepare_pitch_switch(self, semitones: int) -> bool:
-        """Get a windowed pitch ready to switch to, rendering it next if needed.
+    def can_switch_vocals(self, vocals_on: bool) -> bool:
+        """Whether the current song can switch to this vocals state without restarting.
+
+        Turning vocals off also needs the song's separated track to exist,
+        which in background mode may still be a while after the song starts.
+        """
+        if not self._using_rendition_manager:
+            return False
+        if not self.rendition_manager.is_switchable(self.now_playing_transpose, vocals_on):
+            return False
+        return vocals_on or self.rendition_manager.no_vocals_available()
+
+    def prepare_switch(self, semitones: int, vocals_on: bool) -> bool:
+        """Get a rendition ready to switch to, rendering it next if needed.
 
         Passes the current playhead so the wait covers where playback
         actually is, not just the start of the rendition.
@@ -266,7 +295,7 @@ class PlaybackController:
         if not self._using_rendition_manager:
             return False
         return self.rendition_manager.ensure_switchable(
-            semitones, position=self.now_playing_position or 0
+            semitones, vocals_on, position=self.now_playing_position or 0
         )
 
     def get_now_playing(self) -> dict[str, str | int | float | bool | None | list[int]]:
@@ -280,6 +309,9 @@ class PlaybackController:
             "now_playing_user": self.now_playing_user,
             "now_playing_duration": self.now_playing_duration,
             "now_playing_transpose": self.now_playing_transpose,
+            "now_playing_vocals": self.now_playing_vocals,
+            "vocals_switchable": self.is_playing
+            and self.can_switch_vocals(not self.now_playing_vocals),
             "now_playing_url": self.now_playing_url,
             "now_playing_subtitle_url": self.now_playing_subtitle_url,
             "now_playing_position": self.now_playing_position,
@@ -296,6 +328,7 @@ class PlaybackController:
         self.is_paused = True
         self.is_playing = False
         self.now_playing_transpose = 0
+        self.now_playing_vocals = True
         self.now_playing_duration = None
         self.now_playing_position = None
 

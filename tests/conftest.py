@@ -102,6 +102,7 @@ class MockPlaybackController:
     now_playing_filename: str | None = None
     now_playing_user: str | None = None
     now_playing_transpose: int = 0
+    now_playing_vocals: bool = True
     now_playing_duration: int | None = None
     now_playing_url: str | None = None
     now_playing_subtitle_url: str | None = None
@@ -129,7 +130,7 @@ class MockPlaybackController:
             return True
         return False
 
-    def prepare_pitch_switch(self, semitones: int) -> bool:
+    def prepare_switch(self, semitones: int, vocals_on: bool) -> bool:
         return True
 
     def reset_now_playing(self) -> None:
@@ -242,6 +243,7 @@ class MockKaraoke:
         self.volume = 0.85
         self.running = True
         self.now_playing_notification = None
+        self.separating_title = None
 
         # Set preferences that differ from defaults
         self.preferences.set("enable_fair_queue", True)

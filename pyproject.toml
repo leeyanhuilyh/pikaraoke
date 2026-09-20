@@ -25,7 +25,20 @@ dependencies = [
   "flask-socketio>=5.6.1",  # 5.6.1 stops assigning to Flask 3.1.3's read-only session
   "gevent>=24.11.1",
   "sounddevice>=0.5.0; sys_platform != 'linux'",
+  "demucs",
 ]
+
+# The vendored fork, not PyPI's demucs. Resolves torch by platform on its own:
+# the CUDA build on x86_64 Linux/Windows, CPU/MPS wheels on aarch64 (Pi) and macOS.
+[tool.uv.sources]
+demucs = { path = "vendor/demucs", editable = true }
+
+[tool.uv]
+# Intel macOS is left out of the resolution deliberately. torch published no
+# wheels for it after 2.2, so demucs pins torch<2.3 there, and a universal
+# resolution would hold every other platform back to a torch too old to have
+# wheels for the Python this project runs on.
+environments = ["sys_platform != 'darwin' or platform_machine != 'x86_64'"]
 
 [project.optional-dependencies]
 dev = [

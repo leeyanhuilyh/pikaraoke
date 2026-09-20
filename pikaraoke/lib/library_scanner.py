@@ -6,8 +6,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
-from pikaraoke.lib.metadata_parser import youtube_id_suffix
-from pikaraoke.lib.song_list import SongList
+from pikaraoke.lib.metadata_parser import extract_youtube_id
+from pikaraoke.lib.song_list import STEMS_DIR_NAME, SongList
 
 _VALID_EXTENSIONS = SongList.VALID_EXTENSIONS
 
@@ -38,20 +38,9 @@ def build_song_record(
         files_lower = {f.lower() for f in files_in_dir}
     return {
         "file_path": file_path,
-        "youtube_id": _extract_youtube_id(file_path),
+        "youtube_id": extract_youtube_id(file_path),
         "format": _detect_format(file_path, files_lower),
     }
-
-
-def _extract_youtube_id(file_path: str) -> str | None:
-    """Extract YouTube ID from PiKaraoke (---ID) or yt-dlp ([ID]) format."""
-    suffix = youtube_id_suffix(file_path)
-    if not suffix:
-        return None
-    # suffix is '---<ID>' or ' [<ID>]'; strip delimiters to get the 11-char ID
-    if suffix.startswith("---"):
-        return suffix[3:]
-    return suffix.strip(" []")
 
 
 def _detect_format(file_path: str, files_lower: set[str]) -> str:
@@ -182,7 +171,11 @@ class LibraryScanner:
     def _walk_disk(self, songs_dir: str) -> set[str]:
         """Walk the directory tree and collect paths of valid song files."""
         found: set[str] = set()
-        for dirpath, _dirnames, filenames in os.walk(songs_dir):
+        for dirpath, dirnames, filenames in os.walk(songs_dir):
+            # Separated stems are .mp3 files living under the songs directory, so
+            # without this they would be indexed as songs in their own right.
+            if STEMS_DIR_NAME in dirnames:
+                dirnames.remove(STEMS_DIR_NAME)
             for filename in filenames:
                 if os.path.splitext(filename)[1].lower() in _VALID_EXTENSIONS:
                     found.add(os.path.join(dirpath, filename))

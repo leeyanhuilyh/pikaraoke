@@ -281,6 +281,8 @@ def test_preference_manager_defaults_exist():
         "cdg_pixel_scaling",
         "avsync",
         "pitch_window_semitones",
+        "vocal_separation",
+        "vocal_separation_device",
         "browse_results_per_page",
         "low_score_phrases",
         "mid_score_phrases",
