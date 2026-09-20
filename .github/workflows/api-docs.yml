@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - master
-      # Both branches publish to the same openapi.json on gh-pages, so the
-      # spec there reflects whichever was pushed most recently.
-      - main_yh
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
