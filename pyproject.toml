@@ -25,7 +25,6 @@ dependencies = [
   "flask-socketio>=5.6.1",  # 5.6.1 stops assigning to Flask 3.1.3's read-only session
   "gevent>=24.11.1",
   "sounddevice>=0.5.0; sys_platform != 'linux'",
-  "demucs",
 ]
 
 # The vendored fork, not PyPI's demucs. Resolves torch by platform on its own:
@@ -34,6 +33,11 @@ dependencies = [
 demucs = { path = "vendor/demucs", editable = true }
 
 [tool.uv]
+# A default group rather than a project dependency: `uv run` installs it, so
+# vocal separation works out of the box, but torch stays out of the Docker
+# image, the Windows installer and a plain `pip install pikaraoke`, none of
+# which ship the vendor/ submodule it is built from.
+default-groups = ["dev", "vocal-separation"]
 # Intel macOS is left out of the resolution deliberately. torch published no
 # wheels for it after 2.2, so demucs pins torch<2.3 there, and a universal
 # resolution would hold every other platform back to a torch too old to have
@@ -54,6 +58,9 @@ dev = [
     "pylint>=4.0.7",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
+]
+vocal-separation = [
+    "demucs",
 ]
 translations = [
     "deep-translator>=1.11.4",

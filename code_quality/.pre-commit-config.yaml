@@ -37,7 +37,7 @@ repos:
   hooks:
   - id: pylint
     name: Lint Python Code
-    entry: uv run --group translations pylint --rcfile=code_quality/.pylintrc
+    entry: uv run --group translations --no-group vocal-separation pylint --rcfile=code_quality/.pylintrc
     language: system
     types: [python]
     require_serial: true
