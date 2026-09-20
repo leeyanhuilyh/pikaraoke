@@ -6,6 +6,7 @@ from flask_smorest import Blueprint
 
 from pikaraoke.lib.auth import public
 from pikaraoke.lib.current_app import get_karaoke_instance, get_site_name, is_admin
+from pikaraoke.lib.rendition_manager import MAX_SEMITONES, MIN_SEMITONES
 
 _ = flask_babel.gettext
 
@@ -25,6 +26,8 @@ def home():
         # MSG: Title of the home page, which shows the song playing now.
         title=_("Now Playing"),
         transpose_value=k.playback_controller.now_playing_transpose,
+        min_transpose=MIN_SEMITONES,
+        max_transpose=MAX_SEMITONES,
         admin=is_admin(),
         is_transpose_enabled=k.is_transpose_enabled,
         volume=k.volume,

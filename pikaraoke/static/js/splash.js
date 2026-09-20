@@ -14,6 +14,8 @@ let isScoreShown = false;
 const hasBgVideo = PikaraokeConfig.hasBgVideo;
 let currentVideoUrl = null;
 let hlsInstance = null;
+let currentTranspose = 0;
+let audioTrackMap = {};
 let idleTime = 0;
 let screensaverTimeoutSeconds = PikaraokeConfig.screensaverTimeout;
 let bg_playlist = [];
@@ -110,6 +112,8 @@ const endSong = async (reason = null, showScore = false) => {
     isScoreShown = false;
   }
   currentVideoUrl = null;
+  currentTranspose = 0;
+  audioTrackMap = {};
   if (hlsInstance) {
     hlsInstance.destroy();
     hlsInstance = null;
@@ -335,6 +339,7 @@ const handleNowPlayingUpdate = (np) => {
 
   if (np.now_playing_url && np.now_playing_url !== currentVideoUrl) {
     currentVideoUrl = np.now_playing_url;
+    currentTranspose = np.now_playing_transpose;
     const streamUrl = np.now_playing_url;
     $("#video-source").attr("src", "");
     video.load();
@@ -346,7 +351,18 @@ const handleNowPlayingUpdate = (np) => {
         video.src = streamUrl;
       } else {
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        audioTrackMap = {};
         hlsInstance = new Hls({ startPosition: 0 });
+        // Alternate audio renditions (pre-rendered pitch tracks, if any) are
+        // resolved asynchronously after the manifest parses - build the
+        // semitone -> track-index map once they're known.
+        hlsInstance.on(Hls.Events.AUDIO_TRACKS_UPDATED, (event, data) => {
+          audioTrackMap = {};
+          data.audioTracks.forEach((track, idx) => {
+            const semitones = parseInt(track.name, 10);
+            if (!Number.isNaN(semitones)) audioTrackMap[semitones] = idx;
+          });
+        });
         hlsInstance.loadSource(streamUrl);
         hlsInstance.attachMedia(video);
       }
@@ -386,6 +402,14 @@ const handleNowPlayingUpdate = (np) => {
         endSong("failed to start");
       }
     }, playbackStartTimeout);
+  } else if (np.now_playing_url && np.now_playing_transpose !== currentTranspose) {
+    // Same stream, pitch changed to an already pre-rendered semitone -
+    // switch the HLS audio rendition instead of reloading (near-instant,
+    // no video interruption).
+    currentTranspose = np.now_playing_transpose;
+    if (hlsInstance && audioTrackMap.hasOwnProperty(currentTranspose)) {
+      hlsInstance.audioTrack = audioTrackMap[currentTranspose];
+    }
   }
 }
 

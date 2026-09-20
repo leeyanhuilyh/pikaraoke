@@ -280,6 +280,7 @@ def test_preference_manager_defaults_exist():
         "enable_fair_queue",
         "cdg_pixel_scaling",
         "avsync",
+        "pitch_window_semitones",
         "browse_results_per_page",
         "low_score_phrases",
         "mid_score_phrases",

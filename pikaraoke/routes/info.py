@@ -82,6 +82,7 @@ def info():
         high_quality=k.high_quality,
         complete_transcode_before_play=k.complete_transcode_before_play,
         avsync=k.avsync,
+        pitch_window_semitones=k.pitch_window_semitones,
         limit_user_songs_by=k.limit_user_songs_by,
         enable_fair_queue=k.enable_fair_queue,
         buffer_size=k.buffer_size,

@@ -7,6 +7,25 @@
 		window.socket = io({ path: window.pikaraokeConfig.socketioPath });
 	}
 
+	var currentTranspose = {{ transpose_value|default(0) }};
+	var minTranspose = {{ min_transpose|default(-6) }};
+	var maxTranspose = {{ max_transpose|default(6) }};
+
+	function renderTranspose() {
+		$("#semitones-label").html(getSemitonesLabel(currentTranspose));
+		$("#transpose-down").prop("disabled", currentTranspose <= minTranspose);
+		$("#transpose-up").prop("disabled", currentTranspose >= maxTranspose);
+		$("#transpose-reset").prop("disabled", currentTranspose === 0);
+	}
+
+	function setTranspose(target) {
+		target = Math.min(maxTranspose, Math.max(minTranspose, target));
+		if (target === currentTranspose) return;
+		currentTranspose = target;
+		renderTranspose();
+		$.post(window.pikaraokeConfig.basePath + "/transpose/" + target);
+	}
+
 	function loadNowPlaying() {
 		console.log("Loading now playing data");
 		$.get('{{ url_for("now_playing.now_playing") }}', function (data) {
@@ -46,13 +65,8 @@
 			$("#up-next").html({{ _('No song is queued.') | tojson }});
 		}
 
-		if (np.now_playing_transpose != 0) {
-			$("#transpose").val(np.now_playing_transpose);
-			$("#semitones-label").html(getSemitonesLabel(np.now_playing_transpose));
-		} else {
-			$("#transpose").val(0);
-			$("#semitones-label").html(getSemitonesLabel(np.now_playing_transpose));
-		}
+		currentTranspose = np.now_playing_transpose || 0;
+		renderTranspose();
 
 		// set the volume slider to the current volume
 		if (np.volume != volume) {
@@ -75,15 +89,7 @@
 	$(function () {
 		$(".control-box").hide();
 
-		var slider = document.getElementById("transpose");
-		var output = document.getElementById("semitones-label");
-		if (slider && output) {
-			output.innerHTML = getSemitonesLabel(slider.value);
-			// Update the current slider value (each time you drag the slider handle)
-			slider.oninput = function () {
-				output.innerHTML = getSemitonesLabel(slider.value);
-			};
-		}
+		renderTranspose();
 
 		$("#volume-slider").on(
 			"input",
@@ -93,19 +99,16 @@
 			}, 500)
 		);
 
-		$("#submit-transpose").click(function () {
-			var value;
-			if (slider) {
-				value = slider.value;
-			} else {
-				value = 0;
-			}
-			r = confirm(window.translations.confirmTranspose.replace("{label}", getSemitonesLabel(value)));
-			if (r) {
-				$.post(window.pikaraokeConfig.basePath + "/transpose/" + value);
-			}
-			slider.value = 0;
-			output.innerHTML = getSemitonesLabel(slider.value);
+		$("#transpose-down").click(function () {
+			setTranspose(currentTranspose - 1);
+		});
+
+		$("#transpose-up").click(function () {
+			setTranspose(currentTranspose + 1);
+		});
+
+		$("#transpose-reset").click(function () {
+			setTranspose(0);
 		});
 
 		$("#pause-resume").click(function () {
@@ -283,27 +286,19 @@
 			<h4>{% trans %}Change Key{% endtrans %}</h4>
 		</div>
 		<div class="is-flex">
-			<h4 id="semitones-label"></h4>
 			<a id="semitones-info"> <i class="icon icon-info-circled-1" title="Info"></i></a>
 		</div>
 	</div>
-	<div style="width: 100%">
-		<div class="is-flex">
-			<input
-				type="range"
-				min="-12"
-				max="12"
-				value="0"
-				width="300px"
-				class="transpose-slider"
-				id="transpose"
-				style="width: 100%"
-			/>
-			<button id="submit-transpose" class="button is-rounded is-small" style="margin-left: 10px">
-				{# MSG: Label on the button to confirm the change in key/pitch of the playing song. #} {% trans %}Change{%
-				endtrans %}
-			</button>
-		</div>
+	<div class="is-flex" style="align-items: center; gap: 12px">
+		{# MSG: Title attribute on the button to lower the key of the playing song by one semitone. #}
+		<button id="transpose-down" class="button is-rounded" title="{{ _('Lower key') }}">&minus;</button>
+		<h4 id="semitones-label" style="margin: 0; min-width: 120px; text-align: center"></h4>
+		{# MSG: Title attribute on the button to raise the key of the playing song by one semitone. #}
+		<button id="transpose-up" class="button is-rounded" title="{{ _('Raise key') }}">+</button>
+		{# MSG: Label on the button that returns the song to the key it was recorded in. #}
+		<button id="transpose-reset" class="button is-rounded is-small" style="margin-left: auto">
+			{% trans %}Original Key{% endtrans %}
+		</button>
 	</div>
 	{% endif %}
 
