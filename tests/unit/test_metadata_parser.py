@@ -7,6 +7,7 @@ import pytest
 from pikaraoke.lib.metadata_parser import (
     clean_search_query,
     clear_song_name_cache,
+    extract_youtube_id,
     get_best_result,
     get_song_correct_name,
     has_artist_title_separator,
@@ -932,3 +933,19 @@ class TestGetSongCorrectName:
             "Artist - Song", raw_filename="/songs/Artist - Song [dQw4w9WgXcQ].mp4"
         )
         assert result == "Artist - Song"
+
+
+class TestExtractYoutubeId:
+    def test_pikaraoke_format(self):
+        assert extract_youtube_id("Song---dQw4w9WgXcQ.mp4") == "dQw4w9WgXcQ"
+
+    def test_ytdlp_format(self):
+        assert extract_youtube_id("Song [dQw4w9WgXcQ].mp4") == "dQw4w9WgXcQ"
+
+    def test_no_id(self):
+        assert extract_youtube_id("Just A Song.mp4") is None
+
+    def test_pikaraoke_preferred_over_ytdlp(self):
+        # PiKaraoke format takes priority
+        result = extract_youtube_id("Song [AAAAAAAAAAA]---BBBBBBBBBBB.mp4")
+        assert result == "BBBBBBBBBBB"

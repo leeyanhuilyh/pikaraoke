@@ -39,6 +39,7 @@ STATE_CHANGING_ENDPOINTS = {
     "controller.pause",
     "controller.restart",
     "controller.transpose",
+    "controller.vocals",
     "controller.volume",
     "controller.vol_up",
     "controller.vol_down",

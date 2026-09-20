@@ -24,6 +24,9 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       with:
         token: ${{ github.token }}
+        # uv resolves the demucs path dependency from vendor/demucs, so the
+        # directory has to exist even for jobs that don't install it.
+        submodules: true
 
     - name: Cache pre-commit dependencies
       uses: actions/cache@v6
@@ -92,13 +95,17 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v7
+      with:
+        submodules: true
 
     - name: Install uv
       # setup-uv stopped publishing moving major tags at v8, so pin the exact version.
       uses: astral-sh/setup-uv@v9.0.0
 
+    # --no-group vocal-separation: the tests mock the demucs subprocess, so
+    # installing it (and torch, several GB) would only slow the job down.
     - name: Run tests
-      run: uv run pytest tests/ -v --cov=pikaraoke --cov-report=term-missing --cov-report=xml:coverage.xml
+      run: uv run --no-group vocal-separation pytest tests/ -v --cov=pikaraoke --cov-report=term-missing --cov-report=xml:coverage.xml
 
   docker-smoketest:
     runs-on: ubuntu-latest

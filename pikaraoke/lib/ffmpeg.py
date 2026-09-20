@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import subprocess
 from typing import TYPE_CHECKING, Any
@@ -262,6 +263,7 @@ def build_audio_only_ffmpeg_cmd(
     init_filename: str,
     normalize_audio: bool = True,
     avsync: float = 0,
+    audio_source: str | None = None,
 ) -> Any:
     """Build an ffmpeg command for an audio-only HLS rendition at a given pitch.
 
@@ -283,6 +285,9 @@ def build_audio_only_ffmpeg_cmd(
         init_filename: hls_fmp4_init_filename for this rendition.
         normalize_audio: Whether to apply loudness normalization.
         avsync: Audio/video sync adjustment in seconds.
+        audio_source: Audio file to render instead of the song's own audio,
+            e.g. its vocals-removed track. It must line up sample for sample
+            with the song, since it is switched to mid-playback.
 
     Returns:
         ffmpeg stream object ready to execute with run_async().
@@ -292,7 +297,11 @@ def build_audio_only_ffmpeg_cmd(
     if fr.file_path is None:
         raise ValueError("File path is required to build ffmpeg command")
 
-    audio = _ffmpeg_input(fr.file_path, fr.file_extension or "").audio
+    if audio_source:
+        source, extension = audio_source, os.path.splitext(audio_source)[1].lower()
+    else:
+        source, extension = fr.file_path, fr.file_extension or ""
+    audio = _ffmpeg_input(source, extension).audio
     audio = _apply_audio_filters(audio, semitones, avsync, normalize_audio)
 
     output = ffmpeg.output(

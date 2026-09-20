@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from pikaraoke.lib.events import EventSystem
 from pikaraoke.lib.karaoke_database import KaraokeDatabase
@@ -15,6 +16,9 @@ from pikaraoke.lib.metadata_parser import (
     youtube_id_suffix,
 )
 from pikaraoke.lib.song_list import SongList
+
+if TYPE_CHECKING:
+    from pikaraoke.lib.vocal_separator import VocalSeparator
 
 
 def _is_same_file(src: str, dst: str) -> bool:
@@ -63,12 +67,14 @@ class SongManager:
         db: KaraokeDatabase,
         events: EventSystem,
         get_title_tidy: Callable[[], bool] | None = None,
+        vocal_separator: "VocalSeparator | None" = None,
     ) -> None:
         self.download_path = download_path
         self.songs = SongList()
         self._db = db
         self._events = events
         self._get_title_tidy = get_title_tidy
+        self._vocal_separator = vocal_separator
         self._index: list[tuple[str, str]] = []  # (accent-folded raw filename key, path)
         self._index_version: int | None = None
         self._folders: dict[str, list[str]] = {}  # folder key -> immediate subfolder names
@@ -271,6 +277,10 @@ class SongManager:
         for companion in companions:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(companion)
+        # A cached separated track outlives its song otherwise: it lives in the
+        # stems directory rather than beside the song, so it is not a companion.
+        if self._vocal_separator:
+            self._vocal_separator.remove_cached(song_path)
         self.songs.remove(song_path)
         self._db.delete_by_path(song_path)
 

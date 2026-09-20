@@ -37,6 +37,7 @@ from pikaraoke.lib.queue_manager import QueueManager
 from pikaraoke.lib.song_manager import SongManager
 from pikaraoke.lib.sound_manager import SoundManager
 from pikaraoke.lib.url_prefix import append_base_path_to_url
+from pikaraoke.lib.vocal_separator import BEFORE_PLAY, OFF, VocalSeparator
 from pikaraoke.lib.youtube_dl import get_youtubedl_version, upgrade_youtubedl
 from pikaraoke.version import __version__ as VERSION
 
@@ -68,6 +69,9 @@ class Karaoke:
     play_history: PlayHistoryManager
 
     now_playing_notification: str | None = None
+    # Title of the song being separated ahead of playback, shown on the splash
+    # screen. Separate from now_playing, which is empty until playback starts.
+    separating_title: str | None = None
     volume: float
 
     qr_code_path: str | None = None
@@ -234,12 +238,19 @@ class Karaoke:
 
         # Initialize database, scanner, and song manager (startup runs at end of __init__)
         self.db = KaraokeDatabase()
+        self.vocal_separator = VocalSeparator(
+            events=self.events,
+            preferences=self.preferences,
+            songs_dir=self.download_path,
+        )
+        self.vocal_separator.start()
         self.song_manager = SongManager(
             self.download_path,
             db=self.db,
             events=self.events,
             # Preference attributes are set on self by PreferenceManager.load().
             get_title_tidy=lambda: self.enable_title_tidy,  # pylint: disable=no-member
+            vocal_separator=self.vocal_separator,
         )
         self._scanner = LibraryScanner(self.db)
         self._sync_lock = threading.Lock()
@@ -262,6 +273,7 @@ class Karaoke:
             streaming_format=self.streaming_format,
             base_path=self.url_base_path,
             is_transpose_enabled=self.is_transpose_enabled,
+            vocal_separator=self.vocal_separator,
         )
 
         # Event bridging: the coordinator wires manager events to the UI (SocketIO/notifications).
@@ -281,6 +293,10 @@ class Karaoke:
         self._relay_to_browser("play_logged")
         self.events.on("skip_requested", lambda: self.playback_controller.skip(False))
         self.events.on("song_downloaded", self.register_downloaded_song)
+        self.events.on("song_enqueued", self.separate_queued_song)
+        # A song separated in the background may already be playing, and this
+        # is what turns its vocals button on.
+        self.events.on("vocals_separated", lambda *_: self.update_now_playing_socket())
         self._relay_to_browser("sync_started")
         self._relay_to_browser("sync_finished")
 
@@ -315,6 +331,7 @@ class Karaoke:
             download_path=self.download_path,
             youtubedl_proxy=self.youtubedl_proxy,
             additional_ytdl_args=self.additional_ytdl_args,
+            vocal_separator=self.vocal_separator,
         )
         self.download_manager.start()
 
@@ -576,12 +593,36 @@ class Karaoke:
         # Renders it next if it hasn't been reached yet. Even if this times
         # out we still switch rather than restart: the player polls the
         # rendition's playlist as it grows.
-        if not self.playback_controller.prepare_pitch_switch(semitones):
+        pc = self.playback_controller
+        if not pc.prepare_switch(semitones, pc.now_playing_vocals):
             logging.debug(f"Pitch {semitones} not fully buffered yet, switching anyway")
         self.playback_controller.now_playing_transpose = semitones
         # MSG: Message shown after a key change that didn't need to restart the song
         self.log_and_send(_("Changed key to %s semitones") % semitones)
         self.events.emit("now_playing_update")
+
+    def set_vocals(self, vocals_on: bool) -> bool:
+        """Switch the current song's vocals on or off without restarting playback.
+
+        Returns:
+            True if the switch was made, False if this song can't switch (yet).
+        """
+        pc = self.playback_controller
+        if not pc.can_switch_vocals(vocals_on):
+            # MSG: Message shown when the vocals button is used before the song's vocals have been separated
+            self.log_and_send(_("Vocals can't be switched for this song yet"), "danger")
+            return False
+        if not pc.prepare_switch(pc.now_playing_transpose, vocals_on):
+            logging.debug("Vocals rendition not fully buffered yet, switching anyway")
+        pc.now_playing_vocals = vocals_on
+        if vocals_on:
+            # MSG: Message shown after the song's vocals are switched back on
+            self.log_and_send(_("Vocals on"))
+        else:
+            # MSG: Message shown after the song's vocals are switched off
+            self.log_and_send(_("Vocals off"))
+        self.events.emit("now_playing_update")
+        return True
 
     def volume_change(self, vol_level: float) -> bool:
         """Set the volume level.
@@ -663,6 +704,7 @@ class Karaoke:
             "up_next": next_song["title"] if next_song else None,
             "next_user": next_song["user"] if next_song else None,
             "volume": self.volume,
+            "separating": self.separating_title,
             # The splash screen never reloads, so the session name rides this
             # payload rather than being rendered once at page load.
             "session_name": self.play_history.get_current_session_name(),
@@ -686,6 +728,30 @@ class Karaoke:
         """Emit now_playing state change via SocketIO."""
         if self.socketio:
             self.socketio.emit("now_playing", self.get_now_playing(), namespace="/")
+
+    def separate_queued_song(self, song_path: str) -> None:
+        """Start separating a song as it is queued, so it is usually done by its turn.
+
+        Covers songs that were already in the library, which never pass through
+        the download path. Both non-off modes do this: before_play still blocks
+        at play time, but only for whatever the queue hasn't finished by then.
+        """
+        if self.vocal_separator.mode != OFF:
+            self.vocal_separator.queue_separation(song_path)
+
+    def separate_before_play(self, song_path: str) -> None:
+        """In before_play mode, hold playback until the song's vocals-off track exists."""
+        if self.vocal_separator.mode != BEFORE_PLAY:
+            return
+        if self.vocal_separator.cached_track(song_path):
+            return
+        self.separating_title = self.song_manager.display_name_from_path(song_path)
+        self.update_now_playing_socket()
+        try:
+            self.vocal_separator.separate(song_path)
+        finally:
+            self.separating_title = None
+            self.update_now_playing_socket()
 
     def register_downloaded_song(self, song_path: str, youtube_id: str | None) -> None:
         """Add a finished download to the library, then announce it to browsers.
@@ -736,6 +802,7 @@ class Karaoke:
                             self.playback_controller.claim(song["file"])
                     if not song:
                         continue
+                    self.separate_before_play(song["file"])
                     result = self.playback_controller.play_file(
                         song["file"], song["user"], song["semitones"]
                     )

@@ -184,6 +184,8 @@
       'downloading audio': { label: {{ _('Downloading audio') | tojson }}, percent: true, rate: true },
       // {# MSG: Download phase shown while ffmpeg combines the downloaded video and audio. #}
       'merging': { label: {{ _('Merging') | tojson }} },
+      // {# MSG: Download phase shown while Demucs removes the vocals from the downloaded song. #}
+      'separating': { label: {{ _('Separating vocals') | tojson }} },
       // {# MSG: Download phase shown once the download has finished. #}
       'complete': { label: {{ _('Complete') | tojson }}, percent: true }
   };
@@ -229,7 +231,7 @@
 
       // The byte count survives a silence; the rate does not. A stalled download keeps
       // its fill and its percentage and gives up the speed and the ETA.
-      var waiting = d.stalled || d.status === 'merging';
+      var waiting = d.stalled || d.status === 'merging' || d.status === 'separating';
 
       var fill = host.querySelector('.dl-bar-fill');
       fill.style.width = d.progress + '%';

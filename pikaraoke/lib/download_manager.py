@@ -8,14 +8,14 @@ import uuid
 from queue import Queue
 from time import monotonic
 
-import psutil
 from gevent import Greenlet, spawn
 
 from pikaraoke.lib.events import EventSystem
-from pikaraoke.lib.get_platform import is_windows
+from pikaraoke.lib.get_platform import use_spare_capacity
 from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.queue_manager import QueueManager
 from pikaraoke.lib.song_manager import SongManager
+from pikaraoke.lib.vocal_separator import BACKGROUND, BEFORE_PLAY, VocalSeparator
 from pikaraoke.lib.youtube_dl import (
     POSTPROCESS_PREFIX,
     PROGRESS_PREFIX,
@@ -92,24 +92,6 @@ def _summarise_ytdl_failure(output: str) -> str:
     return tail[-1] if tail else "Unknown error"
 
 
-def _use_spare_capacity(process: subprocess.Popen) -> None:
-    """Drop a download to background priority so it never competes with playback.
-
-    Priority is inherited, which is what covers the ffmpeg merge yt-dlp spawns.
-    """
-    try:
-        child = psutil.Process(process.pid)
-        if is_windows():
-            child.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
-            child.ionice(psutil.IOPRIO_VERYLOW)
-        else:
-            child.nice(10)
-            # macOS has no ionice at all, hence AttributeError below.
-            child.ionice(psutil.IOPRIO_CLASS_IDLE)
-    except (psutil.Error, AttributeError, NotImplementedError, OSError) as e:
-        logging.debug(f"Could not lower download priority: {e}")
-
-
 class DownloadManager:
     """Manages a queue of video downloads, processing them serially.
 
@@ -129,6 +111,7 @@ class DownloadManager:
         download_path: str,
         youtubedl_proxy: str | None = None,
         additional_ytdl_args: str | None = None,
+        vocal_separator: VocalSeparator | None = None,
     ) -> None:
         """Initialize the download manager.
 
@@ -140,12 +123,15 @@ class DownloadManager:
             download_path: Directory where downloads are saved.
             youtubedl_proxy: Optional proxy URL for yt-dlp.
             additional_ytdl_args: Optional additional arguments for yt-dlp.
+            vocal_separator: Separator to hand finished downloads to. None
+                disables separation entirely.
         """
         self._events = events
         self._preferences = preferences
         self._song_manager = song_manager
         self._queue_manager = queue_manager
         self._download_path = download_path
+        self._vocal_separator = vocal_separator
         self._youtubedl_proxy = youtubedl_proxy
         self._additional_ytdl_args = additional_ytdl_args
         self.download_queue: Queue = Queue()
@@ -343,7 +329,7 @@ class DownloadManager:
             bufsize=1,  # Line buffered
             universal_newlines=True,
         )
-        _use_spare_capacity(process)
+        use_spare_capacity(process)
 
         output_buffer = []
         video_end = _FALLBACK_VIDEO_END if _selects_separate_streams(cmd) else 100.0
@@ -434,6 +420,26 @@ class DownloadManager:
         )
         return True
 
+    def _separate_vocals(self, song_path: str) -> None:
+        """Separate a finished download's vocals, per the vocal_separation mode.
+
+        In before_play mode this blocks the download worker, which is the point:
+        the song must not reach the playback queue until its vocals-off track
+        exists, or the toggle would be dead for the opening of the song.
+        """
+        if self._vocal_separator is None:
+            return
+        mode = self._vocal_separator.mode
+        if mode == BACKGROUND:
+            self._vocal_separator.queue_separation(song_path)
+        elif mode == BEFORE_PLAY:
+            # The queue page polls while a download is active, so setting the
+            # status is enough to show the phase; it is still the active
+            # download until _process_queue's finally clears it.
+            if self.active_download:
+                self.active_download["status"] = "separating"
+            self._vocal_separator.separate(song_path)
+
     def _execute_download(self, request: dict) -> int:
         """Execute a video download, re-queueing it if it fails with attempts to spare.
 
@@ -521,6 +527,9 @@ class DownloadManager:
                 logging.warning(
                     f"Could not find downloaded song in {self._download_path} matching ID: {video_id}"
                 )
+
+            if song_path:
+                self._separate_vocals(song_path)
 
             if enqueue:
                 if song_path:

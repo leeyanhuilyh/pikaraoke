@@ -27,6 +27,23 @@ dependencies = [
   "sounddevice>=0.5.0; sys_platform != 'linux'",
 ]
 
+# The vendored fork, not PyPI's demucs. Resolves torch by platform on its own:
+# the CUDA build on x86_64 Linux/Windows, CPU/MPS wheels on aarch64 (Pi) and macOS.
+[tool.uv.sources]
+demucs = { path = "vendor/demucs", editable = true }
+
+[tool.uv]
+# A default group rather than a project dependency: `uv run` installs it, so
+# vocal separation works out of the box, but torch stays out of the Docker
+# image, the Windows installer and a plain `pip install pikaraoke`, none of
+# which ship the vendor/ submodule it is built from.
+default-groups = ["dev", "vocal-separation"]
+# Intel macOS is left out of the resolution deliberately. torch published no
+# wheels for it after 2.2, so demucs pins torch<2.3 there, and a universal
+# resolution would hold every other platform back to a torch too old to have
+# wheels for the Python this project runs on.
+environments = ["sys_platform != 'darwin' or platform_machine != 'x86_64'"]
+
 [project.optional-dependencies]
 dev = [
   "pre-commit>=3.7.1",
@@ -41,6 +58,9 @@ dev = [
     "pylint>=4.0.7",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
+]
+vocal-separation = [
+    "demucs",
 ]
 translations = [
     "deep-translator>=1.11.4",

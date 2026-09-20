@@ -276,3 +276,42 @@ class TestBuildAudioOnlyFfmpegCmd:
 
         with pytest.raises(ValueError):
             build_audio_only_ffmpeg_cmd(fr, 0, "/tmp/out.m3u8", "/tmp/out_%03d.m4s", "out_init.mp4")
+
+
+class TestAudioOnlyAlternateSource:
+    """The vocals-removed rendition is the same command over a different audio file."""
+
+    def _args(self, **kwargs):
+        return build_audio_only_ffmpeg_cmd(
+            _make_fr(file_path="/songs/track.mp4"),
+            0,
+            "/tmp/out.m3u8",
+            "/tmp/out_%03d.m4s",
+            "out_init.mp4",
+            **kwargs,
+        ).get_args()
+
+    def test_reads_the_alternate_source_instead_of_the_song(self):
+        args = self._args(audio_source="/songs/.stems/abc.no_vocals.mp3")
+
+        inputs = [args[i + 1] for i, a in enumerate(args) if a == "-i"]
+        assert inputs == ["/songs/.stems/abc.no_vocals.mp3"]
+
+    def test_reads_the_song_by_default(self):
+        args = self._args()
+
+        inputs = [args[i + 1] for i, a in enumerate(args) if a == "-i"]
+        assert inputs == ["/songs/track.mp4"]
+
+    def test_still_pitch_shifts_the_alternate_source(self):
+        """A pitch change with vocals off has to stay off, and stay in the new key."""
+        args = build_audio_only_ffmpeg_cmd(
+            _make_fr(),
+            3,
+            "/tmp/out.m3u8",
+            "/tmp/out_%03d.m4s",
+            "out_init.mp4",
+            audio_source="/songs/.stems/abc.no_vocals.mp3",
+        ).get_args()
+
+        assert "rubberband=pitch=1.189" in args[args.index("-filter_complex") + 1]

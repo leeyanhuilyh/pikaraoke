@@ -1,7 +1,7 @@
-"""Playback control routes for skip, pause, volume, and transpose."""
+"""Playback control routes for skip, pause, volume, transpose, and vocals."""
 
 import flask_babel
-from flask import redirect, request, url_for
+from flask import abort, redirect, request, url_for
 from flask_smorest import Blueprint
 
 from pikaraoke.lib.current_app import broadcast_event, get_karaoke_instance
@@ -48,6 +48,20 @@ def transpose(semitones):
     else:
         broadcast_event("skip", "transpose current")
         k.transpose_current(s)
+    return redirect(url_for("home.home"))
+
+
+@controller_bp.route("/vocals/<state>", methods=["POST"])
+def vocals(state):
+    """Switch the current song's vocals on or off.
+
+    Takes an explicit state rather than toggling, so two remotes pressing the
+    button at once can't cancel each other out.
+    """
+    if state not in ("on", "off"):
+        abort(400)
+    k = get_karaoke_instance()
+    k.set_vocals(state == "on")
     return redirect(url_for("home.home"))
 
 

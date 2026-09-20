@@ -519,3 +519,162 @@ class TestPlaybackControllerResetNowPlaying:
         assert pc.now_playing_user is None
         assert pc.is_playing is False
         assert pc.is_paused is True
+
+
+class TestPlaybackControllerVocals:
+    """Switching a song's vocals on and off without restarting playback."""
+
+    @staticmethod
+    def _controller(test_prefs, separator=None):
+        return PlaybackController(
+            test_prefs,
+            EventSystem(),
+            lambda x, remove_youtube_id=True: x,
+            vocal_separator=separator,
+        )
+
+    def test_cannot_switch_when_the_rendition_manager_is_not_active(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
+        pc.rendition_manager.no_vocals_available = MagicMock(return_value=True)
+
+        assert pc.can_switch_vocals(False) is False
+
+    def test_cannot_turn_vocals_off_before_the_track_is_separated(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
+        pc.rendition_manager.no_vocals_available = MagicMock(return_value=False)
+
+        assert pc.can_switch_vocals(False) is False
+
+    def test_can_turn_vocals_off_once_the_track_exists(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
+        pc.rendition_manager.no_vocals_available = MagicMock(return_value=True)
+
+        assert pc.can_switch_vocals(False) is True
+
+    def test_turning_vocals_back_on_never_needs_the_separated_track(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
+        pc.rendition_manager.no_vocals_available = MagicMock(return_value=False)
+
+        assert pc.can_switch_vocals(True) is True
+
+    def test_switch_is_checked_at_the_current_pitch(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc._using_rendition_manager = True
+        pc.now_playing_transpose = 3
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
+        pc.rendition_manager.no_vocals_available = MagicMock(return_value=True)
+
+        pc.can_switch_vocals(False)
+
+        pc.rendition_manager.is_switchable.assert_called_with(3, False)
+
+    def test_a_pitch_change_stays_on_the_current_vocals_state(self, test_prefs):
+        """Otherwise nudging the key with vocals off would bring the singer back."""
+        pc = self._controller(test_prefs)
+        pc._using_rendition_manager = True
+        pc.now_playing_vocals = False
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
+
+        pc.can_fast_switch(2)
+
+        pc.rendition_manager.is_switchable.assert_called_with(2, False)
+
+    def test_prepare_switch_waits_at_the_playhead(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc._using_rendition_manager = True
+        pc.now_playing_position = 42
+        pc.rendition_manager.ensure_switchable = MagicMock(return_value=True)
+
+        assert pc.prepare_switch(1, False) is True
+
+        pc.rendition_manager.ensure_switchable.assert_called_once_with(1, False, position=42)
+
+    def test_now_playing_reports_the_state_and_whether_the_button_works(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc._using_rendition_manager = True
+        pc.is_playing = True
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
+        pc.rendition_manager.no_vocals_available = MagicMock(return_value=True)
+
+        state = pc.get_now_playing()
+
+        assert state["now_playing_vocals"] is True
+        assert state["vocals_switchable"] is True
+
+    def test_button_is_reported_off_when_nothing_is_playing(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.is_switchable = MagicMock(return_value=True)
+        pc.rendition_manager.no_vocals_available = MagicMock(return_value=True)
+
+        assert pc.get_now_playing()["vocals_switchable"] is False
+
+    def test_a_new_song_starts_with_vocals_on(self, test_prefs):
+        pc = self._controller(test_prefs)
+        pc.now_playing_vocals = False
+
+        pc.reset_now_playing()
+
+        assert pc.now_playing_vocals is True
+
+    @patch("pikaraoke.lib.playback_controller.os.path.isfile", return_value=True)
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    def test_vocal_separation_alone_is_enough_to_use_the_rendition_manager(
+        self, mock_sleep, mock_isfile, test_prefs
+    ):
+        """Pitch pre-rendering is off by default, and the vocals toggle must not need it."""
+        test_prefs.set("pitch_window_semitones", 0)
+        separator = MagicMock()
+        separator.mode = "background"
+        pc = self._controller(test_prefs, separator)
+        mock_result = PlaybackResult(success=True, stream_url="/stream/1.m3u8", duration=180)
+        pc.rendition_manager.start = MagicMock(return_value=mock_result)
+        pc.stream_manager.play_file = MagicMock()
+        pc.is_playing = True
+
+        pc.play_file("/songs/test.mp4", "TestUser")
+
+        pc.rendition_manager.start.assert_called_once()
+        pc.stream_manager.play_file.assert_not_called()
+
+    @patch("pikaraoke.lib.playback_controller.os.path.isfile", return_value=True)
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    def test_the_songs_library_path_is_passed_on_to_find_its_separated_track(
+        self, mock_sleep, mock_isfile, test_prefs
+    ):
+        separator = MagicMock()
+        separator.mode = "background"
+        pc = self._controller(test_prefs, separator)
+        mock_result = PlaybackResult(success=True, stream_url="/stream/1.m3u8", duration=180)
+        pc.rendition_manager.start = MagicMock(return_value=mock_result)
+        pc.is_playing = True
+
+        with patch("pikaraoke.lib.playback_controller.FileResolver"):
+            pc.play_file("/songs/test.mp4", "TestUser")
+
+        assert pc.rendition_manager.start.call_args.args[2] == "/songs/test.mp4"
+
+    @patch("pikaraoke.lib.playback_controller.os.path.isfile", return_value=True)
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    def test_stays_on_the_stream_manager_when_separation_is_off(
+        self, mock_sleep, mock_isfile, test_prefs
+    ):
+        test_prefs.set("pitch_window_semitones", 0)
+        separator = MagicMock()
+        separator.mode = "off"
+        pc = self._controller(test_prefs, separator)
+        mock_result = PlaybackResult(success=True, stream_url="/stream/1.m3u8", duration=180)
+        pc.stream_manager.play_file = MagicMock(return_value=mock_result)
+        pc.rendition_manager.start = MagicMock()
+        pc.is_playing = True
+
+        pc.play_file("/songs/test.mp4", "TestUser")
+
+        pc.rendition_manager.start.assert_not_called()

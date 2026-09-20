@@ -120,6 +120,16 @@ class TestDelete:
         assert not song.exists()
         assert len(sm.songs) == 0
 
+    def test_deletes_cached_separated_track(self, tmp_path, mock_db):
+        """The stem lives outside the song's directory, so nothing else reclaims it."""
+        song = tmp_path / "Test---abc.mp4"
+        song.write_text("fake")
+        separator = MagicMock()
+        sm = SongManager(str(tmp_path), db=mock_db, events=EventSystem(), vocal_separator=separator)
+        sm.songs.add_if_valid(_native(song))
+        sm.delete(_native(song))
+        separator.remove_cached.assert_called_once_with(_native(song))
+
     def test_deletes_cdg_companion(self, tmp_path, mock_db):
         song = tmp_path / "Test---abc.mp4"
         cdg = tmp_path / "Test---abc.cdg"

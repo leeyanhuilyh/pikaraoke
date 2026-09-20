@@ -828,6 +828,17 @@ def youtube_id_suffix(file_path: str) -> str:
     return ""
 
 
+def extract_youtube_id(file_path: str) -> str | None:
+    """Extract YouTube ID from PiKaraoke (---ID) or yt-dlp ([ID]) format."""
+    suffix = youtube_id_suffix(file_path)
+    if not suffix:
+        return None
+    # suffix is '---<ID>' or ' [<ID>]'; strip delimiters to get the 11-char ID
+    if suffix.startswith("---"):
+        return suffix[3:]
+    return suffix.strip(" []")
+
+
 def has_youtube_id(filename: str) -> bool:
     """Detect if a filename contains a YouTube ID in PiKaraoke or yt-dlp format."""
     return bool(youtube_id_suffix(filename))

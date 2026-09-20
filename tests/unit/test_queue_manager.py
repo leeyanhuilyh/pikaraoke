@@ -125,6 +125,22 @@ class TestQueueManagerEnqueue:
 
         assert len(captured) == 1
 
+    def test_enqueue_emits_song_enqueued_with_the_path(self, queue_manager):
+        """Vocal separation of library songs keys off this event."""
+        captured = []
+        queue_manager._events.on("song_enqueued", lambda path: captured.append(path))
+        queue_manager.enqueue("/songs/test---abc.mp4", "User1")
+
+        assert captured == ["/songs/test---abc.mp4"]
+
+    def test_rejected_enqueue_does_not_emit_song_enqueued(self, queue_manager):
+        queue_manager.enqueue("/songs/test---abc.mp4", "User1")
+        captured = []
+        queue_manager._events.on("song_enqueued", lambda path: captured.append(path))
+        queue_manager.enqueue("/songs/test---abc.mp4", "User1")
+
+        assert captured == []
+
 
 class TestQueueManagerFairQueue:
     """Test fair queue algorithm."""
