@@ -425,6 +425,50 @@ class TestUpgradeYoutubedl:
             assert "pip" in second_call_args
             assert "--break-system-packages" in second_call_args
 
+    def test_falls_back_to_uv_when_pip_is_unavailable(self):
+        """Test fallback to uv when pip fails, e.g. a uv-managed venv with no pip module."""
+        pip_message = b"You installed yt-dlp with pip or using the wheel from PyPi"
+        error = subprocess.CalledProcessError(1, "yt-dlp", pip_message)
+        error.output = pip_message
+        pip_error = subprocess.CalledProcessError(1, "pip", b"No module named pip")
+        pip_error.output = b"No module named pip"
+
+        with (
+            patch("pikaraoke.lib.youtube_dl.get_youtubedl_version", return_value="2024.02.01"),
+            patch("pikaraoke.lib.youtube_dl.shutil.which", return_value="/usr/bin/uv"),
+            patch("subprocess.check_output") as mock_check,
+        ):
+            # First call (-U) suggests pip, second (pip) fails, third (uv) succeeds
+            mock_check.side_effect = [error, pip_error, b"Installed yt-dlp"]
+            result = upgrade_youtubedl()
+
+            assert result == "2024.02.01"
+            assert mock_check.call_count == 3
+            uv_call_args = mock_check.call_args_list[2][0][0]
+            assert uv_call_args[0] == "uv"
+            assert "pip" in uv_call_args
+            assert "--upgrade" in uv_call_args
+            assert "yt-dlp" in uv_call_args
+
+    def test_does_not_try_uv_when_not_on_path(self):
+        """Test that a missing uv binary is not attempted, and the upgrade is reported failed."""
+        pip_message = b"You installed yt-dlp with pip or using the wheel from PyPi"
+        error = subprocess.CalledProcessError(1, "yt-dlp", pip_message)
+        error.output = pip_message
+        pip_error = subprocess.CalledProcessError(1, "pip", b"No module named pip")
+        pip_error.output = b"No module named pip"
+
+        with (
+            patch("pikaraoke.lib.youtube_dl.get_youtubedl_version", return_value="2024.01.01"),
+            patch("pikaraoke.lib.youtube_dl.shutil.which", return_value=None),
+            patch("subprocess.check_output") as mock_check,
+        ):
+            mock_check.side_effect = [error, pip_error]
+            result = upgrade_youtubedl()
+
+            assert result == "2024.01.01"
+            assert mock_check.call_count == 2
+
     @patch("pikaraoke.lib.youtube_dl.get_youtubedl_version", return_value="2024.01.01")
     def test_returns_version_after_upgrade(self, mock_version):
         """Test that current version is returned after upgrade."""

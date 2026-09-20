@@ -35,10 +35,19 @@ def pause():
 
 @controller_bp.route("/transpose/<semitones>", methods=["POST"])
 def transpose(semitones):
-    """Transpose (pitch shift) the current song."""
+    """Transpose (pitch shift) the current song.
+
+    If the requested pitch was already pre-rendered, switch to it directly
+    (no restart). Otherwise fall back to restarting the song at the new
+    pitch, same as before pre-rendering existed.
+    """
     k = get_karaoke_instance()
-    broadcast_event("skip", "transpose current")
-    k.transpose_current(int(semitones))
+    s = int(semitones)
+    if k.playback_controller.can_fast_switch(s):
+        k.fast_transpose(s)
+    else:
+        broadcast_event("skip", "transpose current")
+        k.transpose_current(s)
     return redirect(url_for("home.home"))
 
 

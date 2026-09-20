@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Callable
 from flask_babel import _
 
 from pikaraoke.lib.events import EventSystem
-from pikaraoke.lib.file_resolver import delete_tmp_dir
+from pikaraoke.lib.file_resolver import FileResolver, delete_tmp_dir
 from pikaraoke.lib.preference_manager import PreferenceManager
+from pikaraoke.lib.rendition_manager import RenditionManager
 from pikaraoke.lib.stream_manager import PlaybackResult, StreamManager
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ class PlaybackController:
         filename_from_path: Callable[[str, bool], str],
         streaming_format: str = "hls",
         base_path: str = "",
+        is_transpose_enabled: bool = False,
     ) -> None:
         """Initialize the playback controller.
 
@@ -63,11 +65,16 @@ class PlaybackController:
             filename_from_path: Function to extract display name from path.
             streaming_format: Video streaming format ('hls' or 'mp4').
             base_path: URL path prefix when PiKaraoke is hosted under a subpath.
+            is_transpose_enabled: Whether ffmpeg has the rubberband filter,
+                gating whether pitch pre-rendering can be used at all.
         """
         self.preferences = preferences
         self.events = events
         self.filename_from_path = filename_from_path
+        self.is_transpose_enabled = is_transpose_enabled
         self.stream_manager = StreamManager(preferences, streaming_format, base_path)
+        self.rendition_manager = RenditionManager(preferences, base_path)
+        self._using_rendition_manager = False
 
     @property
     def ffmpeg_process(self) -> "subprocess.Popen | None":
@@ -99,7 +106,24 @@ class PlaybackController:
 
         self.claim(file_path)
 
-        result = self.stream_manager.play_file(file_path, semitones)
+        use_rendition_manager = (
+            self.stream_manager.streaming_format == "hls"
+            and self.is_transpose_enabled
+            and int(self.preferences.get_or_default("pitch_window_semitones")) > 0
+        )
+        if use_rendition_manager:
+            try:
+                fr = FileResolver(file_path, self.stream_manager.streaming_format)
+            except Exception as e:
+                error_message = _("Error resolving file: %s") % str(e)
+                logging.error(error_message)
+                result = PlaybackResult(success=False, error=error_message)
+            else:
+                result = self.rendition_manager.start(fr, semitones)
+            self._using_rendition_manager = True
+        else:
+            result = self.stream_manager.play_file(file_path, semitones)
+            self._using_rendition_manager = False
 
         if not result.success:
             self.now_playing_filename = None
@@ -163,7 +187,10 @@ class PlaybackController:
                 self.events.emit("notification", _("Song ended abnormally: %s") % reason, "danger")
 
         self.reset_now_playing()
-        self.stream_manager.kill_ffmpeg()
+        if self._using_rendition_manager:
+            self.rendition_manager.kill_all()
+        else:
+            self.stream_manager.kill_ffmpeg()
         # Small delay to ensure FFmpeg fully terminates and file handles close
         # Critical on Raspberry Pi with slow SD cards and hardware encoder cleanup
         time.sleep(0.3)
@@ -215,7 +242,34 @@ class PlaybackController:
             logging.warning("Tried to pause, but no file is playing!")
             return False
 
-    def get_now_playing(self) -> dict[str, str | int | float | bool | None]:
+    def can_fast_switch(self, semitones: int) -> bool:
+        """Whether a pitch change can switch HLS audio renditions instead of restarting.
+
+        Args:
+            semitones: Requested transpose value.
+
+        Returns:
+            True if pre-rendering is active for the current song and this
+            pitch is one the master playlist declares. The rendition does
+            not have to exist yet - it can be rendered on demand and
+            switched to while it is still writing. Only a pitch outside the
+            declared range needs a new playlist, and therefore a restart.
+        """
+        return self._using_rendition_manager and self.rendition_manager.is_switchable(semitones)
+
+    def prepare_pitch_switch(self, semitones: int) -> bool:
+        """Get a windowed pitch ready to switch to, rendering it next if needed.
+
+        Passes the current playhead so the wait covers where playback
+        actually is, not just the start of the rendition.
+        """
+        if not self._using_rendition_manager:
+            return False
+        return self.rendition_manager.ensure_switchable(
+            semitones, position=self.now_playing_position or 0
+        )
+
+    def get_now_playing(self) -> dict[str, str | int | float | bool | None | list[int]]:
         """Get the current playback state.
 
         Returns:

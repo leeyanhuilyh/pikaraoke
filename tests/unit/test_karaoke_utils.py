@@ -418,6 +418,38 @@ class TestTransposeCurrent:
         assert mock_karaoke_with_songs.playback_controller.skipped_reasons == []
 
 
+class TestFastTranspose:
+    """Tests for fast_transpose, the no-restart pitch switch."""
+
+    def _start_playing(self, k, path="/songs/Artist - Song One---abc123.mp4"):
+        k.playback_controller.now_playing = "Artist - Song One"
+        k.playback_controller.now_playing_filename = path
+        k.playback_controller.now_playing_user = "Alice"
+        k.playback_controller.is_playing = True
+        return path
+
+    def test_updates_transpose_without_restarting(self, mock_karaoke_with_songs):
+        k = mock_karaoke_with_songs
+        self._start_playing(k)
+
+        k.fast_transpose(3)
+
+        assert k.playback_controller.now_playing_transpose == 3
+        # No skip/restart: the song keeps playing under the same filename.
+        assert k.playback_controller.skipped_reasons == []
+        assert k.playback_controller.now_playing == "Artist - Song One"
+
+    def test_emits_now_playing_update(self, mock_karaoke_with_songs):
+        k = mock_karaoke_with_songs
+        self._start_playing(k)
+        emitted = []
+        k.events.on("now_playing_update", lambda: emitted.append(True))
+
+        k.fast_transpose(3)
+
+        assert emitted == [True]
+
+
 class TestRegisterDownloadedSong:
     """Tests for the register_downloaded_song method."""
 

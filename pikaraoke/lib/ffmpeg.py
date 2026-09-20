@@ -14,6 +14,57 @@ from pikaraoke.lib.get_platform import is_running_in_docker
 if TYPE_CHECKING:
     from pikaraoke.lib.file_resolver import FileResolver
 
+HLS_SEGMENT_SECONDS = 3
+
+
+def _ffmpeg_input(file_path: str, file_extension: str):
+    """Build an ffmpeg input, adding genpts for containers with VFR/timestamp issues."""
+    if file_extension in [".webm", ".avi", ".mov", ".mkv"]:
+        return ffmpeg.input(file_path, **{"fflags": "+genpts"})
+    return ffmpeg.input(file_path)
+
+
+def _video_codec_and_bitrate(is_cdg: bool, file_extension: str) -> tuple[str, str]:
+    """Pick video codec and bitrate for a transcode.
+
+    CDG always needs encoding; MP4 can copy video stream (already H.264
+    compatible). WEBM uses VP8/VP9 which must be transcoded to H.264 for
+    fMP4 containers. Pi 3B+ struggles with 5M in real-time, 2M provides
+    better stability with the hardware encoder.
+    """
+    using_hardware_encoder = supports_hardware_h264_encoding()
+    default_vcodec = "h264_v4l2m2m" if using_hardware_encoder else "libx264"
+
+    if is_cdg:
+        vcodec = "libx264"
+    else:
+        vcodec = "copy" if file_extension == ".mp4" else default_vcodec
+
+    if is_cdg:
+        vbitrate = "500k"
+    elif using_hardware_encoder:
+        vbitrate = "2M"
+    else:
+        vbitrate = "5M"
+
+    return vcodec, vbitrate
+
+
+def _apply_audio_filters(audio, semitones: int, avsync: float, normalize_audio: bool):
+    """Apply avsync, pitch-shift, and loudness-normalization filters, in that order."""
+    if avsync > 0:
+        audio = audio.filter("adelay", f"{avsync * 1000}|{avsync * 1000}")
+    elif avsync < 0:
+        audio = audio.filter("atrim", start=-avsync)
+
+    if semitones != 0:
+        audio = audio.filter("rubberband", pitch=2 ** (semitones / 12))
+
+    if normalize_audio:
+        audio = audio.filter("loudnorm", i=-16, tp=-1.5, lra=11)
+
+    return audio
+
 
 def get_media_duration(file_path: str) -> int | None:
     """Get the duration of a media file in seconds.
@@ -63,50 +114,14 @@ def build_ffmpeg_cmd(
     if fr.file_path is None:
         raise ValueError("File path is required to build ffmpeg command")
 
-    # Use h/w acceleration on Pi
-    using_hardware_encoder = supports_hardware_h264_encoding()
-    default_vcodec = "h264_v4l2m2m" if using_hardware_encoder else "libx264"
-
-    # CDG always needs encoding; MP4 can copy video stream (already H.264 compatible)
-    # WEBM uses VP8/VP9 which must be transcoded to H.264 for fMP4 containers
-    if is_cdg:
-        vcodec = "libx264"
-    else:
-        vcodec = "copy" if fr.file_extension == ".mp4" else default_vcodec
-
-    # Optimize bitrate: CDG is simple graphics (500k), video files need more
-    # Pi 3B+ struggles with 5M in real-time, 2M provides better stability
-    if is_cdg:
-        vbitrate = "500k"
-    elif using_hardware_encoder:
-        vbitrate = "2M"
-    else:
-        vbitrate = "5M"
+    vcodec, vbitrate = _video_codec_and_bitrate(is_cdg, fr.file_extension or "")
 
     # Copy audio if no processing needed, otherwise re-encode with AAC
     # CDG always re-encodes audio for compatibility
     acodec = "aac" if is_cdg or is_transposed or normalize_audio or avsync != 0 else "copy"
 
-    # For container formats with VFR or timestamp issues, use genpts
-    if fr.file_extension in [".webm", ".avi", ".mov", ".mkv"]:
-        input = ffmpeg.input(fr.file_path, **{"fflags": "+genpts"})
-    else:
-        input = ffmpeg.input(fr.file_path)
-    audio = input.audio
-
-    # Audio sync adjustment: delay or trim
-    if avsync > 0:
-        audio = audio.filter("adelay", f"{avsync * 1000}|{avsync * 1000}")
-    elif avsync < 0:
-        audio = audio.filter("atrim", start=-avsync)
-
-    # Pitch shifting: 2^(semitones/12)
-    if is_transposed:
-        audio = audio.filter("rubberband", pitch=2 ** (semitones / 12))
-
-    # Loudness normalization
-    if normalize_audio:
-        audio = audio.filter("loudnorm", i=-16, tp=-1.5, lra=11)
+    input = _ffmpeg_input(fr.file_path, fr.file_extension or "")
+    audio = _apply_audio_filters(input.audio, semitones, avsync, normalize_audio)
 
     # Video source: CDG input or original video stream
     if is_cdg:
@@ -152,13 +167,18 @@ def build_ffmpeg_cmd(
             ar=48000,  # Standard sample rate
             preset="ultrafast",
             f="hls",
-            hls_time=3,
+            hls_time=HLS_SEGMENT_SECONDS,
             hls_list_size=0,
             hls_playlist_type="event",
             hls_segment_type="fmp4",
             hls_fmp4_init_filename=fr.init_filename,
             hls_segment_filename=fr.segment_pattern,
             video_bitrate=vbitrate,
+            # Without an explicit keyframe interval, segments can only be cut
+            # at whatever keyframe interval the encoder defaults to (often
+            # 8-10s), so hls_time alone is a no-op and segments end up 2-3x
+            # longer than intended. No effect when video is stream-copied.
+            force_key_frames=f"expr:gte(t,n_forced*{HLS_SEGMENT_SECONDS})",
             # CDG needs pix_fmt for proper color space
             **({"pix_fmt": "yuv420p"} if is_cdg else {}),
             **{
@@ -166,6 +186,130 @@ def build_ffmpeg_cmd(
                 "avoid_negative_ts": "make_zero",
             },
         )
+
+    args = output.get_args()
+    logging.debug(f"COMMAND: ffmpeg " + " ".join(args))
+    return output
+
+
+def build_video_only_ffmpeg_cmd(
+    fr: FileResolver,
+    output_file: str,
+    segment_filename: str,
+    init_filename: str,
+    cdg_pixel_scaling: bool = False,
+) -> Any:
+    """Build an ffmpeg command for a video-only HLS rendition.
+
+    Used by pitch pre-rendering: video never changes with pitch, so it's
+    transcoded once and shared across every pitch rendition instead of
+    being re-encoded per semitone.
+
+    Args:
+        fr: FileResolver instance with source file information.
+        output_file: Path to write the HLS playlist (.m3u8) to.
+        segment_filename: hls_segment_filename pattern for this rendition.
+        init_filename: hls_fmp4_init_filename for this rendition.
+        cdg_pixel_scaling: Enable pixel scaling for CDG rendering.
+
+    Returns:
+        ffmpeg stream object ready to execute with run_async().
+    """
+    is_cdg = fr.cdg_file_path is not None
+
+    if fr.file_path is None:
+        raise ValueError("File path is required to build ffmpeg command")
+
+    vcodec, vbitrate = _video_codec_and_bitrate(is_cdg, fr.file_extension or "")
+
+    if is_cdg:
+        logging.info("Playing CDG/MP3 file: " + fr.file_path)
+        cdg_input = ffmpeg.input(fr.cdg_file_path, copyts=None)
+        video = cdg_input.video.filter("fps", fps=25)
+        if cdg_pixel_scaling:
+            video = video.filter("scale", -1, 720, flags="neighbor")
+    else:
+        video = _ffmpeg_input(fr.file_path, fr.file_extension or "").video
+
+    output = ffmpeg.output(
+        video,
+        output_file,
+        vcodec=vcodec,
+        preset="ultrafast",
+        f="hls",
+        hls_time=HLS_SEGMENT_SECONDS,
+        hls_list_size=0,
+        hls_playlist_type="event",
+        hls_segment_type="fmp4",
+        hls_fmp4_init_filename=init_filename,
+        hls_segment_filename=segment_filename,
+        video_bitrate=vbitrate,
+        force_key_frames=f"expr:gte(t,n_forced*{HLS_SEGMENT_SECONDS})",
+        **({"pix_fmt": "yuv420p"} if is_cdg else {}),
+        **{"fps_mode": "cfr", "avoid_negative_ts": "make_zero"},
+    )
+
+    args = output.get_args()
+    logging.debug(f"COMMAND: ffmpeg " + " ".join(args))
+    return output
+
+
+def build_audio_only_ffmpeg_cmd(
+    fr: FileResolver,
+    semitones: int,
+    output_file: str,
+    segment_filename: str,
+    init_filename: str,
+    normalize_audio: bool = True,
+    avsync: float = 0,
+) -> Any:
+    """Build an ffmpeg command for an audio-only HLS rendition at a given pitch.
+
+    Used by pitch pre-rendering to render one alternate-audio HLS rendition
+    per cached semitone. Runs to completion rather than staying open for
+    live control, so no -re pacing is needed - it only has to keep pace
+    with a background render, not real-time playback.
+
+    The playlist is written incrementally (event, not vod) so a rendition
+    can be switched to while it is still rendering: a vod playlist only
+    lands when ffmpeg exits, which would make a half-rendered pitch
+    unplayable and force playback to wait for a full render.
+
+    Args:
+        fr: FileResolver instance with source file information.
+        semitones: Number of semitones to shift pitch (0 = no shift).
+        output_file: Path to write the HLS playlist (.m3u8) to.
+        segment_filename: hls_segment_filename pattern for this rendition.
+        init_filename: hls_fmp4_init_filename for this rendition.
+        normalize_audio: Whether to apply loudness normalization.
+        avsync: Audio/video sync adjustment in seconds.
+
+    Returns:
+        ffmpeg stream object ready to execute with run_async().
+    """
+    avsync = float(avsync)
+
+    if fr.file_path is None:
+        raise ValueError("File path is required to build ffmpeg command")
+
+    audio = _ffmpeg_input(fr.file_path, fr.file_extension or "").audio
+    audio = _apply_audio_filters(audio, semitones, avsync, normalize_audio)
+
+    output = ffmpeg.output(
+        audio,
+        output_file,
+        acodec="aac",
+        audio_bitrate="192k",
+        ac=2,
+        ar=48000,
+        f="hls",
+        hls_time=HLS_SEGMENT_SECONDS,
+        hls_list_size=0,
+        hls_playlist_type="event",
+        hls_segment_type="fmp4",
+        hls_fmp4_init_filename=init_filename,
+        hls_segment_filename=segment_filename,
+    )
 
     args = output.get_args()
     logging.debug(f"COMMAND: ffmpeg " + " ".join(args))
