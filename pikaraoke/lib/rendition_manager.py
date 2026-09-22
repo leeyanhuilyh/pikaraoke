@@ -204,6 +204,7 @@ class RenditionManager:
         # wait for - start it here rather than leave the caller waiting on
         # a render that would never happen.
         self.prioritize(semitones)
+        started = time.monotonic()
         self._launch_render(fr, semitones, background=False)
         marker = f"{fr.stream_uid}_audio_{semitone_label(semitones)}_"
         playlist = audio_playlist_path(fr, semitones)
@@ -218,8 +219,12 @@ class RenditionManager:
                 # than the playhead implies - near the end of a song there
                 # simply aren't any more to wait for.
                 if _count_segments(fr.tmp_dir, marker) >= needed or self._is_complete(semitones):
+                    logging.info(
+                        f"Pitch {semitones} switchable after " f"{time.monotonic() - started:.1f}s"
+                    )
                     return True
             if time.monotonic() >= deadline:
+                logging.info(f"Pitch {semitones} not ready after {timeout:.0f}s, switching anyway")
                 return False
             time.sleep(READY_POLL_INTERVAL_SECONDS)
 
@@ -255,6 +260,10 @@ class RenditionManager:
         with self._lock:
             self._fr = fr
             self._declared = declared
+
+        logging.info(
+            f"Pitch pre-render: base={base_semitones}, window=±{window}, " f"declared={declared}"
+        )
 
         video_cmd = build_video_only_ffmpeg_cmd(
             fr,
@@ -292,6 +301,7 @@ class RenditionManager:
                 (s for s in prerendered if s != base_semitones),
                 key=lambda s: abs(s - base_semitones),
             )
+        logging.info(f"Pitch pre-render: queued in background: {self._pending}")
         self._bg_thread = Thread(
             target=self._render_remaining, args=(fr, base_semitones), daemon=True
         )
@@ -331,6 +341,8 @@ class RenditionManager:
 
         if already_running:
             proc = existing
+            if not background:
+                logging.info(f"Pitch {semitones} already rendering in background, prioritizing it")
         else:
             normalize_audio = self.preferences.get_or_default("normalize_audio")
             avsync = self.preferences.get_or_default("avsync")
@@ -347,6 +359,9 @@ class RenditionManager:
             proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
             with self._lock:
                 self._audio_processes[semitones] = proc
+            logging.info(
+                f"Rendering pitch {semitones} " f"({'background' if background else 'on-demand'})"
+            )
 
         if background:
             lower_priority(proc)
@@ -357,6 +372,7 @@ class RenditionManager:
     def _render_one(self, fr: "FileResolver", semitones: int, background: bool = True) -> bool:
         """Render one audio-only rendition and mark it ready to play from."""
         label = semitone_label(semitones)
+        started = time.monotonic()
         proc = self._launch_render(fr, semitones, background)
         if proc is None:
             return False
@@ -370,6 +386,7 @@ class RenditionManager:
         if ready:
             with self._lock:
                 self._ready.add(semitones)
+            logging.info(f"Pitch {semitones} ready after {time.monotonic() - started:.1f}s")
         return ready
 
     def _render_remaining(self, fr: "FileResolver", base_semitones: int) -> None:
@@ -385,6 +402,7 @@ class RenditionManager:
         while not self._stop_event.is_set():
             with self._lock:
                 if not self._pending:
+                    logging.info("Pitch pre-render queue empty, background rendering done")
                     return
                 semitones = self._pending.pop(0)
             self._render_one(fr, semitones)
