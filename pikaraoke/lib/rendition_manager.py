@@ -392,6 +392,7 @@ class RenditionManager:
                 avsync,
             )
             proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
+            started = time.monotonic()
             with self._lock:
                 self._audio_processes[semitones] = proc
                 if background:
@@ -399,12 +400,35 @@ class RenditionManager:
             logging.info(
                 f"Rendering pitch {semitones} " f"({'background' if background else 'on-demand'})"
             )
+            Thread(
+                target=self._log_full_completion, args=(semitones, proc, started), daemon=True
+            ).start()
 
         if background:
             lower_priority(proc)
         else:
             restore_priority(proc)
         return proc
+
+    def _log_full_completion(self, semitones: int, proc: subprocess.Popen, started: float) -> None:
+        """Log when a rendition's ffmpeg actually finishes writing the whole
+        song - separate from "ready" above, which only needs the first few
+        segments. Ready times alone can't tell a slow queue from a slow
+        render; this is the number that answers that.
+        """
+        exit_code = proc.wait()
+        if self._stop_event.is_set():
+            # A nonzero exit here is us tearing this process down on
+            # purpose (e.g. a restart superseded it), not worth logging.
+            return
+        elapsed = time.monotonic() - started
+        if exit_code == 0:
+            logging.info(f"Pitch {semitones} finished rendering (full song) in {elapsed:.1f}s")
+        else:
+            logging.debug(
+                f"Pitch {semitones} render process exited with code {exit_code} "
+                f"after {elapsed:.1f}s"
+            )
 
     def _render_one(self, fr: "FileResolver", semitones: int, background: bool = True) -> bool:
         """Render one audio-only rendition and mark it ready to play from."""
