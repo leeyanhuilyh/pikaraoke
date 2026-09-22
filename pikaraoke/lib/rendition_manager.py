@@ -170,6 +170,10 @@ class RenditionManager:
         # a pitch out of this - it's no longer discretionary once someone
         # is actually waiting on it).
         self._background_alive: set[int] = set()
+        # The pitch currently being listened to. Only this one has to keep
+        # pace with playback, so it is the only one held at foreground
+        # priority (see _set_active).
+        self._active: int | None = None
         self._declared: list[int] = []
         self._pending: list[int] = []
         self._fr: "FileResolver | None" = None
@@ -245,6 +249,7 @@ class RenditionManager:
                     logging.info(
                         f"Pitch {semitones} switchable after " f"{time.monotonic() - started:.1f}s"
                     )
+                    self._set_active(semitones)
                     return True
             if time.monotonic() >= deadline:
                 logging.info(
@@ -252,6 +257,26 @@ class RenditionManager:
                 )
                 return False
             time.sleep(READY_POLL_INTERVAL_SECONDS)
+
+    def _set_active(self, semitones: int) -> None:
+        """Make one pitch the foreground render and push every other one down.
+
+        Only the pitch being listened to has to keep pace with playback; the
+        rest are discretionary. Without this sweep, stepping through keys
+        leaves every pitch touched on the way at foreground priority,
+        competing with the one actually playing - six quick steps means six
+        rivals, which is enough to starve a later on-demand render.
+        """
+        with self._lock:
+            self._active = semitones
+            processes = dict(self._audio_processes)
+        for pitch, proc in processes.items():
+            if proc.poll() is not None:
+                continue
+            if pitch == semitones:
+                restore_priority(proc)
+            else:
+                lower_priority(proc)
 
     def _is_complete(self, semitones: int) -> bool:
         """Whether this rendition's ffmpeg finished writing successfully."""
@@ -313,6 +338,7 @@ class RenditionManager:
         if not self._render_one(fr, base_semitones, background=False):
             self.kill_all()
             return PlaybackResult(success=False, error=_("Failed to prepare audio stream"))
+        self._set_active(base_semitones)
 
         master_path = f"{fr.tmp_dir}/{fr.stream_uid}.m3u8"
         with open(master_path, "w") as f:
@@ -503,6 +529,7 @@ class RenditionManager:
             self._ready.clear()
             self._rendering.clear()
             self._background_alive.clear()
+            self._active = None
             self._declared = []
             self._pending = []
             self._fr = None

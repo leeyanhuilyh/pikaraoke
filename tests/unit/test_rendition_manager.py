@@ -116,6 +116,9 @@ class TestRenditionManagerStart:
         assert result.success is True
         assert result.stream_url == f"/stream/{fr.stream_uid}.m3u8"
         assert (tmp_path / f"{fr.stream_uid}.m3u8").exists()
+        # The base pitch is what's being listened to from the first frame,
+        # so it starts out as the one holding foreground priority.
+        assert rm._active == 0
 
     @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=True)
     @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
@@ -599,3 +602,66 @@ class TestRenditionManagerKillAll:
         rm = RenditionManager(test_prefs)
 
         rm.kill_all()  # should not raise
+
+
+class TestRenditionManagerActivePitch:
+    """Tests for _set_active: exactly one pitch holds foreground priority."""
+
+    def test_active_pitch_is_restored_and_the_rest_are_lowered(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        procs = {s: MagicMock(**{"poll.return_value": None}) for s in (-1, 0, 1)}
+        rm._audio_processes = dict(procs)
+
+        with (
+            patch("pikaraoke.lib.rendition_manager.lower_priority") as mock_lower,
+            patch("pikaraoke.lib.rendition_manager.restore_priority") as mock_restore,
+        ):
+            rm._set_active(1)
+
+        mock_restore.assert_called_once_with(procs[1])
+        assert {c.args[0] for c in mock_lower.call_args_list} == {procs[-1], procs[0]}
+        assert rm._active == 1
+
+    def test_stepping_through_keys_leaves_only_the_last_one_foreground(self, test_prefs):
+        """The bug this exists for: every pitch stepped through used to stay
+        at foreground priority, so six quick steps left six rivals."""
+        rm = RenditionManager(test_prefs)
+        procs = {s: MagicMock(**{"poll.return_value": None}) for s in range(-2, 3)}
+        rm._audio_processes = dict(procs)
+
+        with (
+            patch("pikaraoke.lib.rendition_manager.lower_priority") as mock_lower,
+            patch("pikaraoke.lib.rendition_manager.restore_priority") as mock_restore,
+        ):
+            for pitch in (-1, -2, -1, 0, 1, 2):
+                rm._set_active(pitch)
+
+        # Only the final pitch is foreground; the five it passed through are
+        # all back down, each demoted on the step that superseded it.
+        assert rm._active == 2
+        assert mock_restore.call_args_list[-1].args[0] is procs[2]
+        assert procs[1] in {c.args[0] for c in mock_lower.call_args_list}
+
+    def test_skips_a_process_that_already_exited(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        finished = MagicMock(**{"poll.return_value": 0})
+        running = MagicMock(**{"poll.return_value": None})
+        rm._audio_processes = {0: finished, 1: running}
+
+        with (
+            patch("pikaraoke.lib.rendition_manager.lower_priority") as mock_lower,
+            patch("pikaraoke.lib.rendition_manager.restore_priority") as mock_restore,
+        ):
+            rm._set_active(1)
+
+        mock_restore.assert_called_once_with(running)
+        mock_lower.assert_not_called()
+
+    def test_kill_all_clears_the_active_pitch(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        rm._audio_processes = {2: MagicMock(**{"poll.return_value": None})}
+        rm._set_active(2)
+
+        rm.kill_all()
+
+        assert rm._active is None
