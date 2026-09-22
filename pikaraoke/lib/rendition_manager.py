@@ -23,6 +23,7 @@ from pikaraoke.lib.ffmpeg import (
     build_video_only_ffmpeg_cmd,
 )
 from pikaraoke.lib.preference_manager import PreferenceManager
+from pikaraoke.lib.process_priority import lower_priority, restore_priority
 from pikaraoke.lib.stream_manager import PlaybackResult
 from pikaraoke.lib.url_prefix import normalize_url_base_path
 
@@ -203,7 +204,7 @@ class RenditionManager:
         # wait for - start it here rather than leave the caller waiting on
         # a render that would never happen.
         self.prioritize(semitones)
-        self._launch_render(fr, semitones)
+        self._launch_render(fr, semitones, background=False)
         marker = f"{fr.stream_uid}_audio_{semitone_label(semitones)}_"
         playlist = audio_playlist_path(fr, semitones)
         needed = int((position + SWITCH_LOOKAHEAD_SECONDS) // HLS_SEGMENT_SECONDS) + 1
@@ -274,7 +275,7 @@ class RenditionManager:
             self.kill_all()
             return PlaybackResult(success=False, error=_("Failed to prepare video stream"))
 
-        if not self._render_one(fr, base_semitones):
+        if not self._render_one(fr, base_semitones, background=False):
             self.kill_all()
             return PlaybackResult(success=False, error=_("Failed to prepare audio stream"))
 
@@ -307,41 +308,56 @@ class RenditionManager:
             duration=fr.duration,
         )
 
-    def _launch_render(self, fr: "FileResolver", semitones: int) -> subprocess.Popen | None:
+    def _launch_render(
+        self, fr: "FileResolver", semitones: int, background: bool = True
+    ) -> subprocess.Popen | None:
         """Start one rendition's ffmpeg, unless it is already running.
 
         Safe to call from both the background queue and an on-demand
-        switch, which can race for the same pitch.
+        switch, which can race for the same pitch. `background` sets this
+        process's OS scheduling priority every time this is called for it,
+        whether it was just started or was already running - so a render
+        the background queue started gets bumped back to normal priority
+        the moment someone actually asks for that pitch, rather than
+        staying deprioritized while they wait on it.
         """
         with self._lock:
             existing = self._audio_processes.get(semitones)
-            if semitones in self._rendering and existing is not None:
-                return existing
-            self._rendering.add(semitones)
-            if semitones in self._pending:
-                self._pending.remove(semitones)
+            already_running = semitones in self._rendering and existing is not None
+            if not already_running:
+                self._rendering.add(semitones)
+                if semitones in self._pending:
+                    self._pending.remove(semitones)
 
-        normalize_audio = self.preferences.get_or_default("normalize_audio")
-        avsync = self.preferences.get_or_default("avsync")
-        label = semitone_label(semitones)
-        cmd = build_audio_only_ffmpeg_cmd(
-            fr,
-            semitones,
-            audio_playlist_path(fr, semitones),
-            f"{fr.tmp_dir}/{fr.stream_uid}_audio_{label}_segment_%03d.m4s",
-            f"{fr.stream_uid}_audio_{label}_init.mp4",
-            normalize_audio,
-            avsync,
-        )
-        proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
-        with self._lock:
-            self._audio_processes[semitones] = proc
+        if already_running:
+            proc = existing
+        else:
+            normalize_audio = self.preferences.get_or_default("normalize_audio")
+            avsync = self.preferences.get_or_default("avsync")
+            label = semitone_label(semitones)
+            cmd = build_audio_only_ffmpeg_cmd(
+                fr,
+                semitones,
+                audio_playlist_path(fr, semitones),
+                f"{fr.tmp_dir}/{fr.stream_uid}_audio_{label}_segment_%03d.m4s",
+                f"{fr.stream_uid}_audio_{label}_init.mp4",
+                normalize_audio,
+                avsync,
+            )
+            proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
+            with self._lock:
+                self._audio_processes[semitones] = proc
+
+        if background:
+            lower_priority(proc)
+        else:
+            restore_priority(proc)
         return proc
 
-    def _render_one(self, fr: "FileResolver", semitones: int) -> bool:
+    def _render_one(self, fr: "FileResolver", semitones: int, background: bool = True) -> bool:
         """Render one audio-only rendition and mark it ready to play from."""
         label = semitone_label(semitones)
-        proc = self._launch_render(fr, semitones)
+        proc = self._launch_render(fr, semitones, background)
         if proc is None:
             return False
         ready = _wait_until_ready(

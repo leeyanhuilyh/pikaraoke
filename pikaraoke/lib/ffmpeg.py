@@ -58,7 +58,10 @@ def _apply_audio_filters(audio, semitones: int, avsync: float, normalize_audio: 
         audio = audio.filter("atrim", start=-avsync)
 
     if semitones != 0:
-        audio = audio.filter("rubberband", pitch=2 ** (semitones / 12))
+        # pitchq=speed is already librubberband's default on recent ffmpeg
+        # builds, but older builds (e.g. what a Raspberry Pi OS repo ships)
+        # may default elsewhere - set it explicitly rather than assume.
+        audio = audio.filter("rubberband", pitch=2 ** (semitones / 12), pitchq="speed")
 
     if normalize_audio:
         audio = audio.filter("loudnorm", i=-16, tp=-1.5, lra=11)

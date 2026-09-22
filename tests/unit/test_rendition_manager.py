@@ -22,6 +22,16 @@ def test_prefs():
     return PreferenceManager("/nonexistent/test_config.ini")
 
 
+@pytest.fixture(autouse=True)
+def no_reprioritize():
+    """Keep psutil away from whatever pid a mocked Popen invents."""
+    with (
+        patch("pikaraoke.lib.rendition_manager.lower_priority"),
+        patch("pikaraoke.lib.rendition_manager.restore_priority"),
+    ):
+        yield
+
+
 def _make_mock_fr(tmp_dir="/tmp", stream_uid=12345, ass_file_path=None, duration=180):
     mock_fr = MagicMock()
     mock_fr.tmp_dir = tmp_dir
@@ -304,7 +314,7 @@ class TestRenditionManagerEnsureSwitchable:
         with patch.object(rm, "_launch_render") as mock_launch:
             assert rm.ensure_switchable(5, position=0, timeout=1) is True
 
-        mock_launch.assert_called_once_with(fr, 5)
+        mock_launch.assert_called_once_with(fr, 5, background=False)
 
     def test_false_when_rendition_has_not_reached_the_playhead(self, test_prefs, tmp_path):
         """The opening being rendered is not enough to switch 60s into a song."""
@@ -363,6 +373,91 @@ class TestRenditionManagerReadiness:
 
         assert rm.is_rendered(2) is True
         assert rm.is_rendered(5) is False
+
+
+class TestRenditionManagerPriority:
+    """Tests for OS scheduling priority: background renders never outrank
+    live playback or a render someone is actively waiting on."""
+
+    @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
+    def test_background_render_is_lowered(self, mock_cmd, test_prefs, tmp_path):
+        mock_cmd.return_value.run_async.return_value = MagicMock()
+        rm = RenditionManager(test_prefs)
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+
+        with (
+            patch("pikaraoke.lib.rendition_manager.lower_priority") as mock_lower,
+            patch("pikaraoke.lib.rendition_manager.restore_priority") as mock_restore,
+        ):
+            rm._launch_render(fr, 3, background=True)
+
+        mock_lower.assert_called_once()
+        mock_restore.assert_not_called()
+
+    @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
+    def test_on_demand_render_is_kept_at_normal_priority(self, mock_cmd, test_prefs, tmp_path):
+        mock_cmd.return_value.run_async.return_value = MagicMock()
+        rm = RenditionManager(test_prefs)
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+
+        with (
+            patch("pikaraoke.lib.rendition_manager.lower_priority") as mock_lower,
+            patch("pikaraoke.lib.rendition_manager.restore_priority") as mock_restore,
+        ):
+            rm._launch_render(fr, 3, background=False)
+
+        mock_restore.assert_called_once()
+        mock_lower.assert_not_called()
+
+    @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
+    def test_already_running_background_render_is_boosted_on_demand(
+        self, mock_cmd, test_prefs, tmp_path
+    ):
+        """A pitch already mid-render in the background queue, once someone
+        actually asks for it, must stop being deprioritized - the caller is
+        waiting on it now, not speculating."""
+        mock_cmd.return_value.run_async.return_value = MagicMock()
+        rm = RenditionManager(test_prefs)
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+
+        with (
+            patch("pikaraoke.lib.rendition_manager.lower_priority"),
+            patch("pikaraoke.lib.rendition_manager.restore_priority"),
+        ):
+            rm._launch_render(fr, 3, background=True)  # started by the background queue
+
+        with (
+            patch("pikaraoke.lib.rendition_manager.lower_priority") as mock_lower,
+            patch("pikaraoke.lib.rendition_manager.restore_priority") as mock_restore,
+        ):
+            proc = rm._launch_render(fr, 3, background=False)  # now requested on demand
+
+        mock_restore.assert_called_once_with(proc)
+        mock_lower.assert_not_called()
+        mock_cmd.return_value.run_async.assert_called_once()  # no second process spawned
+
+    @patch("pikaraoke.lib.rendition_manager.build_video_only_ffmpeg_cmd")
+    @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
+    @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=True)
+    def test_base_pitch_render_at_song_start_is_not_lowered(
+        self, mock_ready, mock_audio_cmd, mock_video_cmd, test_prefs, tmp_path
+    ):
+        """The base pitch is needed immediately to start playback, not speculative."""
+        mock_video_cmd.return_value.run_async.return_value = MagicMock()
+        mock_audio_cmd.return_value.run_async.return_value = MagicMock()
+        rm = RenditionManager(test_prefs)
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+
+        with (
+            patch.object(rm, "_render_remaining"),
+            patch("pikaraoke.lib.rendition_manager.lower_priority") as mock_lower,
+            patch("pikaraoke.lib.rendition_manager.restore_priority") as mock_restore,
+        ):
+            result = rm.start(fr, base_semitones=0)
+
+        assert result.success is True
+        mock_lower.assert_not_called()
+        mock_restore.assert_called_once()
 
 
 class TestRenditionManagerKillAll:

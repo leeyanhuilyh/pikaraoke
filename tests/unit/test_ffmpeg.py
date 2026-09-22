@@ -246,6 +246,21 @@ class TestBuildAudioOnlyFfmpegCmd:
         filter_arg = args[args.index("-filter_complex") + 1]
         assert "rubberband=pitch=1.259" in filter_arg
 
+    def test_forces_fast_pitch_quality(self):
+        # Some ffmpeg/rubberband builds (e.g. what Raspberry Pi OS ships)
+        # may not default pitchq to speed - set it explicitly rather than
+        # assume, since a background/on-demand render's throughput matters.
+        args = build_audio_only_ffmpeg_cmd(
+            _make_fr(),
+            4,
+            "/tmp/out_audio_p4.m3u8",
+            "/tmp/out_audio_p4_%03d.m4s",
+            "out_audio_p4_init.mp4",
+        ).get_args()
+
+        filter_arg = args[args.index("-filter_complex") + 1]
+        assert "pitchq=speed" in filter_arg
+
     def test_zero_semitones_skips_rubberband(self):
         args = build_audio_only_ffmpeg_cmd(
             _make_fr(),
