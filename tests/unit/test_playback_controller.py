@@ -427,6 +427,37 @@ class TestPlaybackControllerCanFastSwitch:
         assert pc.can_fast_switch(2) is True
 
 
+class TestPlaybackControllerNotePlaybackPosition:
+    """Tests for the playhead feed that pitch pre-rendering paces against."""
+
+    def test_records_position_and_feeds_the_rendition_manager(self, test_prefs):
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc._using_rendition_manager = True
+        pc.rendition_manager.note_position = MagicMock()
+
+        pc.note_playback_position(42.5)
+
+        assert pc.now_playing_position == 42.5
+        pc.rendition_manager.note_position.assert_called_once_with(42.5)
+
+    def test_records_position_without_a_rendition_manager(self, test_prefs):
+        """The legacy single-stream path has nothing to pace, but position is
+        still what the player and the UI read."""
+        events = EventSystem()
+        filename_fn = lambda x, remove_youtube_id=True: x
+
+        pc = PlaybackController(test_prefs, events, filename_fn)
+        pc.rendition_manager.note_position = MagicMock()
+
+        pc.note_playback_position(42.5)
+
+        assert pc.now_playing_position == 42.5
+        pc.rendition_manager.note_position.assert_not_called()
+
+
 class TestPlaybackControllerPlayFileRenditionManager:
     """Tests for the RenditionManager branch of PlaybackController.play_file."""
 

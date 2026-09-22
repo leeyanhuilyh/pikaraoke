@@ -242,6 +242,17 @@ class PlaybackController:
             logging.warning("Tried to pause, but no file is playing!")
             return False
 
+    def note_playback_position(self, position: float) -> None:
+        """Record where playback actually is, as reported by the player.
+
+        Pitch pre-rendering paces itself against this: it keeps each
+        windowed rendition a bounded distance ahead of the playhead rather
+        than racing every one of them to the end of the song.
+        """
+        self.now_playing_position = position
+        if self._using_rendition_manager:
+            self.rendition_manager.note_position(position)
+
     def can_fast_switch(self, semitones: int) -> bool:
         """Whether a pitch change can switch HLS audio renditions instead of restarting.
 

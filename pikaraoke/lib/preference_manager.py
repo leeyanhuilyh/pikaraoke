@@ -43,7 +43,12 @@ class PreferenceManager:
         "avsync": 0,
         # Semitones on each side of the current key to pre-render in the
         # background for instant pitch switching. 0 disables pre-rendering.
-        "pitch_window_semitones": 0,
+        # Measured on a Raspberry Pi 4: each rendition costs roughly a
+        # quarter of a core to keep paced alongside playback, so 2 (four
+        # renditions plus the base) fits with headroom while the full +/-6
+        # range would not. Pitches outside the window still work, they just
+        # render when asked for instead of being ready in advance.
+        "pitch_window_semitones": 2,
         "browse_results_per_page": 100,
         "low_score_phrases": "",
         "mid_score_phrases": "",

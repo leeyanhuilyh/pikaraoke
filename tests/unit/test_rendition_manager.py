@@ -1,6 +1,6 @@
 """Unit tests for rendition_manager module."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -110,7 +110,7 @@ class TestRenditionManagerStart:
         rm = RenditionManager(test_prefs)
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
 
-        with patch.object(rm, "_render_remaining"):
+        with patch.object(rm, "_pace_renditions"):
             result = rm.start(fr, base_semitones=0)
 
         assert result.success is True
@@ -119,27 +119,6 @@ class TestRenditionManagerStart:
         # The base pitch is what's being listened to from the first frame,
         # so it starts out as the one holding foreground priority.
         assert rm._active == 0
-
-    @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=True)
-    @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
-    @patch("pikaraoke.lib.rendition_manager.build_video_only_ffmpeg_cmd")
-    def test_window_renders_before_start_returns(
-        self, mock_video_cmd, mock_audio_cmd, mock_ready, test_prefs, tmp_path
-    ):
-        """BLOCK_PLAYBACK_UNTIL_WINDOW_RENDERED: the whole window is done,
-        not just queued, by the time start() hands back a stream URL."""
-        test_prefs.set("pitch_window_semitones", 2)
-        mock_video_cmd.return_value.run_async.return_value = MagicMock()
-        mock_audio_cmd.return_value.run_async.return_value = MagicMock()
-        rm = RenditionManager(test_prefs)
-        fr = _make_mock_fr(tmp_dir=str(tmp_path))
-
-        result = rm.start(fr, base_semitones=0)
-
-        assert result.success is True
-        assert rm._pending == []
-        assert sorted(rm._ready) == [-2, -1, 0, 1, 2]
-        assert rm._bg_thread is None
 
     @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=False)
     @patch("pikaraoke.lib.rendition_manager.build_video_only_ffmpeg_cmd")
@@ -167,13 +146,13 @@ class TestRenditionManagerStart:
         rm = RenditionManager(test_prefs)
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
 
-        with patch.object(rm, "_render_remaining"):
+        with patch.object(rm, "_pace_renditions"):
             rm.start(fr, base_semitones=0)
 
         assert rm._declared == list(range(MIN_SEMITONES, MAX_SEMITONES + 1))
         # Nearest-to-base first, so the pitches a singer is most likely to
         # step to next are ready soonest.
-        assert rm._pending == [-1, 1, -2, 2]
+        assert rm._window == [0, -1, 1, -2, 2]
 
     @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=True)
     @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
@@ -187,177 +166,11 @@ class TestRenditionManagerStart:
         rm = RenditionManager(test_prefs)
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
 
-        with patch.object(rm, "_render_remaining"):
+        with patch.object(rm, "_pace_renditions"):
             rm.start(fr, base_semitones=4)
 
-        assert max(rm._pending) == MAX_SEMITONES
-        assert min(rm._pending) == -1
-
-
-class TestRenditionManagerConcurrencyCap:
-    """Tests for MAX_CONCURRENT_BACKGROUND_RENDERS."""
-
-    def test_slot_unavailable_when_cap_reached(self, test_prefs):
-        rm = RenditionManager(test_prefs)
-        alive1, alive2 = MagicMock(), MagicMock()
-        alive1.poll.return_value = None
-        alive2.poll.return_value = None
-        rm._audio_processes = {1: alive1, 2: alive2}
-        rm._background_alive = {1, 2}
-
-        assert rm._background_slot_available() is False
-
-    def test_slot_available_below_cap(self, test_prefs):
-        rm = RenditionManager(test_prefs)
-        alive1 = MagicMock()
-        alive1.poll.return_value = None
-        rm._audio_processes = {1: alive1}
-        rm._background_alive = {1}
-
-        assert rm._background_slot_available() is True
-
-    def test_prunes_a_render_that_finished(self, test_prefs):
-        rm = RenditionManager(test_prefs)
-        finished = MagicMock()
-        finished.poll.return_value = 0
-        rm._audio_processes = {1: finished}
-        rm._background_alive = {1}
-
-        assert rm._background_slot_available() is True
-        assert rm._background_alive == set()
-
-    def test_a_boosted_render_no_longer_counts_against_the_cap(self, test_prefs, tmp_path):
-        """Someone actively waiting on a pitch isn't background contention."""
-        rm = RenditionManager(test_prefs)
-        fr = _make_mock_fr(tmp_dir=str(tmp_path))
-        proc1, proc2 = MagicMock(), MagicMock()
-        proc1.poll.return_value = None
-        proc2.poll.return_value = None
-        rm._audio_processes = {1: proc1, 2: proc2}
-        rm._rendering = {1, 2}
-        rm._background_alive = {1, 2}
-
-        rm._launch_render(fr, 1, background=False)  # boost, doesn't spawn (already running)
-
-        assert rm._background_alive == {2}
-        assert rm._background_slot_available() is True
-
-    def test_third_render_waits_for_a_slot_to_free_up(self, test_prefs, tmp_path):
-        """Renders 1 and 2 fill the cap; 3 must wait until one exits."""
-        rm = RenditionManager(test_prefs)
-        fr = _make_mock_fr(tmp_dir=str(tmp_path))
-        rm._pending = [1, 2, 3]
-        alive_count_at_launch = []
-        poll_calls = {"n": 0}
-
-        def fake_render_one(fr_arg, semitones):
-            alive_count_at_launch.append(len(rm._background_alive))
-            proc = MagicMock()
-            if semitones == 1:
-                # Exits only after being polled a few times, simulating a
-                # background render that keeps running for a while.
-                def poll():
-                    poll_calls["n"] += 1
-                    return 0 if poll_calls["n"] > 2 else None
-
-                proc.poll.side_effect = poll
-            else:
-                proc.poll.return_value = None
-            rm._audio_processes[semitones] = proc
-            rm._background_alive.add(semitones)
-            return True
-
-        with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr)
-
-        assert alive_count_at_launch == [0, 1, 1]
-        assert poll_calls["n"] > 2
-
-
-class TestRenditionManagerSequentialRendering:
-    """Tests for _render_remaining's queue draining."""
-
-    def test_renders_queue_in_order(self, test_prefs, tmp_path):
-        rm = RenditionManager(test_prefs)
-        fr = _make_mock_fr(tmp_dir=str(tmp_path))
-        rm._pending = [1, 2, 3]
-        call_order = []
-
-        def fake_render_one(fr_arg, semitones):
-            call_order.append(semitones)
-            return True
-
-        with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr)
-
-        assert call_order == [1, 2, 3]
-
-    def test_advances_once_a_rendition_is_ready_not_once_it_fully_finishes(
-        self, test_prefs, tmp_path
-    ):
-        """A rendition keeps encoding the rest of the song in the background
-        after it's ready - the queue must not wait for that to finish, or
-        each item ends up gated on close to the song's full runtime."""
-        rm = RenditionManager(test_prefs)
-        fr = _make_mock_fr(tmp_dir=str(tmp_path))
-        rm._pending = [1, 2]
-        events = []
-
-        def fake_render_one(fr_arg, semitones):
-            events.append(f"ready-{semitones}")
-            proc = MagicMock()
-            proc.wait.side_effect = lambda: events.append(f"finished-{semitones}")
-            rm._audio_processes[semitones] = proc
-            return True
-
-        with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr)
-
-        # Both renditions are started (ready) before either is waited on to
-        # fully finish - "finished" events, if any, must not appear between them.
-        assert events == ["ready-1", "ready-2"]
-
-    def test_stops_when_stop_event_set_mid_sequence(self, test_prefs, tmp_path):
-        rm = RenditionManager(test_prefs)
-        fr = _make_mock_fr(tmp_dir=str(tmp_path))
-        rm._pending = [1, 2, 3]
-        call_order = []
-
-        def fake_render_one(fr_arg, semitones):
-            call_order.append(semitones)
-            if semitones == 1:
-                rm._stop_event.set()
-            return True
-
-        with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr)
-
-        assert call_order == [1]
-
-    def test_prioritize_moves_a_queued_pitch_to_the_front(self, test_prefs, tmp_path):
-        rm = RenditionManager(test_prefs)
-        fr = _make_mock_fr(tmp_dir=str(tmp_path))
-        rm._pending = [1, -1, 2, -2]
-        call_order = []
-
-        def fake_render_one(fr_arg, semitones):
-            call_order.append(semitones)
-            return True
-
-        rm.prioritize(-2)
-
-        with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr)
-
-        assert call_order == [-2, 1, -1, 2]
-
-    def test_prioritize_ignores_a_pitch_that_is_not_queued(self, test_prefs):
-        rm = RenditionManager(test_prefs)
-        rm._pending = [1, 2]
-
-        rm.prioritize(9)
-
-        assert rm._pending == [1, 2]
+        assert max(rm._window) == MAX_SEMITONES
+        assert min(rm._window) == -1
 
 
 class TestRenditionManagerIsSwitchable:
@@ -374,7 +187,6 @@ class TestRenditionManagerIsSwitchable:
         rm = RenditionManager(test_prefs)
         rm._declared = [-2, -1, 0, 1, 2]
         rm._ready = {0}
-        rm._pending = []
 
         assert rm.is_switchable(2) is True
         assert rm.is_rendered(2) is False
@@ -406,7 +218,6 @@ class TestRenditionManagerEnsureSwitchable:
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._fr = fr
         rm._declared = [0, 1, 2]
-        rm._pending = [1, 2]
         self._write_rendition(tmp_path, fr, "p2", segments=3)
 
         with patch.object(rm, "_launch_render"):
@@ -418,7 +229,6 @@ class TestRenditionManagerEnsureSwitchable:
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._fr = fr
         rm._declared = [0, 1, 2, 5]
-        rm._pending = [1, 2]
         self._write_rendition(tmp_path, fr, "p5", segments=3)
 
         with patch.object(rm, "_launch_render") as mock_launch:
@@ -432,7 +242,6 @@ class TestRenditionManagerEnsureSwitchable:
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._fr = fr
         rm._declared = [0, 1, 2]
-        rm._pending = [2]
         self._write_rendition(tmp_path, fr, "p2", segments=3)
 
         with patch.object(rm, "_launch_render"):
@@ -443,7 +252,6 @@ class TestRenditionManagerEnsureSwitchable:
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._fr = fr
         rm._declared = [0, 1, 2]
-        rm._pending = [2]
         # 60s playhead + 6s lookahead over 3s segments needs 23 segments.
         self._write_rendition(tmp_path, fr, "p2", segments=23)
 
@@ -468,7 +276,6 @@ class TestRenditionManagerEnsureSwitchable:
         rm = RenditionManager(test_prefs)
         rm._fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._declared = [0, 1, 2]
-        rm._pending = [2]
 
         with patch.object(rm, "_launch_render"):
             assert rm.ensure_switchable(2, timeout=0.2) is False
@@ -559,7 +366,7 @@ class TestRenditionManagerPriority:
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
 
         with (
-            patch.object(rm, "_render_remaining"),
+            patch.object(rm, "_pace_renditions"),
             patch("pikaraoke.lib.rendition_manager.lower_priority") as mock_lower,
             patch("pikaraoke.lib.rendition_manager.restore_priority") as mock_restore,
         ):
@@ -665,3 +472,167 @@ class TestRenditionManagerActivePitch:
         rm.kill_all()
 
         assert rm._active is None
+
+
+class TestRenditionManagerPacing:
+    """Tests for _pace_once: renditions are kept a bounded distance past the
+    playhead and frozen the rest of the time, one running at a time."""
+
+    @staticmethod
+    def _rm_with_window(prefs, window, rendered):
+        """A manager mid-song, with `rendered` seconds of audio per pitch."""
+        rm = RenditionManager(prefs)
+        rm._window = list(window)
+        rm._audio_processes = {s: MagicMock(**{"poll.return_value": None}) for s in rendered}
+        rm._rendering = set(rendered)
+        rm._rendered_seconds = lambda fr, s: rendered[s]
+        return rm
+
+    def test_a_rendition_far_enough_ahead_is_frozen(self, test_prefs, tmp_path):
+        rm = self._rm_with_window(test_prefs, [0, 1], {0: 300, 1: 300})
+        rm._position = 10
+
+        with (
+            patch.object(rm, "_suspend") as mock_suspend,
+            patch.object(rm, "_resume") as mock_resume,
+        ):
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        assert {c.args[0] for c in mock_suspend.call_args_list} == {0, 1}
+        mock_resume.assert_not_called()
+
+    def test_only_one_rendition_runs_at_a_time(self, test_prefs, tmp_path):
+        """The whole point of pacing: three pitches all behind their target
+        must not all run at once, or they starve each other."""
+        rm = self._rm_with_window(test_prefs, [0, 1, -1], {0: 0, 1: 0, -1: 0})
+        rm._position = 60
+
+        with (
+            patch.object(rm, "_suspend") as mock_suspend,
+            patch.object(rm, "_resume") as mock_resume,
+        ):
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        assert len(mock_resume.call_args_list) == 1
+        assert {c.args[0] for c in mock_suspend.call_args_list} == {1, -1}
+
+    def test_the_playing_pitch_gets_the_slot_first(self, test_prefs, tmp_path):
+        """Whatever is being listened to must never fall behind the playhead,
+        so it outranks pitches nobody is hearing yet."""
+        rm = self._rm_with_window(test_prefs, [0, 1, 2], {0: 0, 1: 0, 2: 0})
+        rm._position = 60
+        rm._active = 2
+
+        with (
+            patch.object(rm, "_suspend"),
+            patch.object(rm, "_resume") as mock_resume,
+        ):
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        mock_resume.assert_called_once_with(2)
+
+    def test_a_pitch_someone_is_waiting_on_keeps_running(self, test_prefs, tmp_path):
+        """A caller blocked in ensure_switchable needs its target making
+        progress, however far ahead of the playhead it already is."""
+        rm = self._rm_with_window(test_prefs, [0, 1], {0: 0, 1: 300})
+        rm._position = 10
+        rm._awaited = 1
+
+        with (
+            patch.object(rm, "_suspend") as mock_suspend,
+            patch.object(rm, "_resume") as mock_resume,
+        ):
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        assert 1 in {c.args[0] for c in mock_resume.call_args_list}
+        assert 1 not in {c.args[0] for c in mock_suspend.call_args_list}
+
+    def test_an_unstarted_pitch_is_launched(self, test_prefs, tmp_path):
+        rm = self._rm_with_window(test_prefs, [0, 1], {0: 300})
+        rm._rendered_seconds = lambda fr, s: 300 if s == 0 else 0
+        rm._position = 10
+
+        with (
+            patch.object(rm, "_suspend"),
+            patch.object(rm, "_launch_render") as mock_launch,
+        ):
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        mock_launch.assert_called_once()
+        assert mock_launch.call_args.args[1] == 1
+
+    def test_a_finished_rendition_is_left_alone(self, test_prefs, tmp_path):
+        """Nothing to pace once ffmpeg has written the whole song."""
+        rm = self._rm_with_window(test_prefs, [0], {0: 30})
+        rm._audio_processes[0].poll.return_value = 0
+        rm._position = 600
+
+        with (
+            patch.object(rm, "_suspend") as mock_suspend,
+            patch.object(rm, "_resume") as mock_resume,
+        ):
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        mock_resume.assert_not_called()
+        assert mock_suspend.call_args_list == [call(0)]
+
+    def test_lead_is_measured_from_the_playhead_not_the_start(self, test_prefs, tmp_path):
+        """Content that was plenty at the start of the song stops being
+        enough once the playhead has moved past it."""
+        rm = self._rm_with_window(test_prefs, [0], {0: 40})
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+
+        rm._position = 0
+        with patch.object(rm, "_suspend") as early_suspend, patch.object(rm, "_resume"):
+            rm._pace_once(fr)
+
+        rm._position = 120
+        with patch.object(rm, "_suspend"), patch.object(rm, "_resume") as late_resume:
+            rm._pace_once(fr)
+
+        assert early_suspend.call_args_list == [call(0)]
+        late_resume.assert_called_once_with(0)
+
+
+class TestRenditionManagerSuspendResume:
+    """Tests for the suspend/resume bookkeeping."""
+
+    def test_suspend_freezes_a_running_render_once(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        proc = MagicMock(**{"poll.return_value": None})
+        rm._audio_processes = {1: proc}
+
+        with patch("pikaraoke.lib.rendition_manager.suspend_process") as mock_suspend:
+            rm._suspend(1)
+            rm._suspend(1)
+
+        mock_suspend.assert_called_once_with(proc)
+        assert rm._suspended == {1}
+
+    def test_resume_thaws_only_a_suspended_render(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        proc = MagicMock(**{"poll.return_value": None})
+        rm._audio_processes = {1: proc}
+
+        with patch("pikaraoke.lib.rendition_manager.resume_process") as mock_resume:
+            rm._resume(1)  # not suspended: nothing to do
+            rm._suspended.add(1)
+            rm._resume(1)
+
+        mock_resume.assert_called_once_with(proc)
+        assert rm._suspended == set()
+
+    def test_asking_for_a_suspended_pitch_resumes_it(self, test_prefs, tmp_path):
+        """ensure_switchable's launch path has to thaw a frozen rendition -
+        a caller waiting on one that stays frozen would wait forever."""
+        rm = RenditionManager(test_prefs)
+        proc = MagicMock(**{"poll.return_value": None})
+        rm._audio_processes = {1: proc}
+        rm._rendering = {1}
+        rm._suspended = {1}
+
+        with patch("pikaraoke.lib.rendition_manager.resume_process") as mock_resume:
+            rm._launch_render(_make_mock_fr(tmp_dir=str(tmp_path)), 1, background=False)
+
+        mock_resume.assert_called_once_with(proc)
+        assert rm._suspended == set()
