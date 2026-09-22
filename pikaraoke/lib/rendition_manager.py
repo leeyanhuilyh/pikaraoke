@@ -52,6 +52,17 @@ SWITCH_WAIT_TIMEOUT_SECONDS = 15
 # while the song plays (the original behavior). Flip and compare.
 BLOCK_PLAYBACK_UNTIL_WINDOW_RENDERED = True
 
+# Background renders (not the base pitch, not an on-demand one - those
+# always run immediately regardless) are capped to this many alive at
+# once. Audio-only rendering is confirmed single-threaded per process, and
+# video uses the Pi's hardware encoder rather than CPU, so this is a cap
+# on concurrent processes, not cores directly - 2 leaves real headroom on
+# a 4-core Pi for the video pipeline, the web server, and anything else
+# happening at the same time. Measured need: letting renders pile up
+# unbounded made each successive one slower than the last, from ~1s to
+# ~12s across a 13-pitch window, as they increasingly starved each other.
+MAX_CONCURRENT_BACKGROUND_RENDERS = 2
+
 
 def semitone_label(semitones: int) -> str:
     """Filename-safe token for a semitone value: p3 / m3 / p0.
@@ -154,6 +165,11 @@ class RenditionManager:
         self._audio_processes: dict[int, subprocess.Popen] = {}
         self._ready: set[int] = set()
         self._rendering: set[int] = set()
+        # Pitches counted against MAX_CONCURRENT_BACKGROUND_RENDERS: still
+        # alive and still genuinely background (a boost to on-demand drops
+        # a pitch out of this - it's no longer discretionary once someone
+        # is actually waiting on it).
+        self._background_alive: set[int] = set()
         self._declared: list[int] = []
         self._pending: list[int] = []
         self._fr: "FileResolver | None" = None
@@ -359,6 +375,8 @@ class RenditionManager:
         if already_running:
             proc = existing
             if not background:
+                with self._lock:
+                    self._background_alive.discard(semitones)
                 logging.info(f"Pitch {semitones} already rendering in background, prioritizing it")
         else:
             normalize_audio = self.preferences.get_or_default("normalize_audio")
@@ -376,6 +394,8 @@ class RenditionManager:
             proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
             with self._lock:
                 self._audio_processes[semitones] = proc
+                if background:
+                    self._background_alive.add(semitones)
             logging.info(
                 f"Rendering pitch {semitones} " f"({'background' if background else 'on-demand'})"
             )
@@ -406,19 +426,43 @@ class RenditionManager:
             logging.info(f"Pitch {semitones} ready after {time.monotonic() - started:.1f}s")
         return ready
 
+    def _background_slot_available(self) -> bool:
+        """Prune background renders that finished or got boosted, then
+        report whether there's room for another under the concurrency cap."""
+        with self._lock:
+            self._background_alive = {
+                s
+                for s in self._background_alive
+                if (proc := self._audio_processes.get(s)) is not None and proc.poll() is None
+            }
+            return len(self._background_alive) < MAX_CONCURRENT_BACKGROUND_RENDERS
+
     def _render_remaining(self, fr: "FileResolver") -> None:
         """Render the rest of the pitch window in the background.
 
-        Each queued pitch is launched once the previous one is ready to
-        switch to - not once it has fully finished encoding, which can
-        take the length of the whole song. A rendition that's past ready
-        keeps writing in the background at low priority, so letting the
-        next one start alongside it doesn't compete with live playback;
-        that protection is what nice/ionice on background renders is for.
-        Renditions are pulled from a queue rather than a fixed list so a
-        pitch the singer asks for can jump ahead of the ones queued near it.
+        Each queued pitch is launched once a background slot is free, not
+        once the previous one has fully finished encoding, which can take
+        the length of the whole song. A rendition that's past ready keeps
+        writing in the background at low priority behind the scenes; the
+        cap exists because letting those pile up unbounded made each
+        successive render slower than the last, as they increasingly
+        starved each other for CPU. Renditions are pulled from a queue
+        rather than a fixed list so a pitch the singer asks for can jump
+        ahead of the ones queued near it.
         """
         while not self._stop_event.is_set():
+            with self._lock:
+                pending_empty = not self._pending
+            if pending_empty:
+                logging.info("Pitch pre-render queue empty, background rendering done")
+                return
+            if not self._background_slot_available():
+                # Nothing left to render is checked above, before this -
+                # otherwise an empty queue with slots still occupied by
+                # long-running renders would wait here forever for
+                # capacity it will never need.
+                time.sleep(READY_POLL_INTERVAL_SECONDS)
+                continue
             with self._lock:
                 if not self._pending:
                     logging.info("Pitch pre-render queue empty, background rendering done")
@@ -434,6 +478,7 @@ class RenditionManager:
             self._audio_processes.clear()
             self._ready.clear()
             self._rendering.clear()
+            self._background_alive.clear()
             self._declared = []
             self._pending = []
             self._fr = None

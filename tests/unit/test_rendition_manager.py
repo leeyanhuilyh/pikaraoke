@@ -191,6 +191,86 @@ class TestRenditionManagerStart:
         assert min(rm._pending) == -1
 
 
+class TestRenditionManagerConcurrencyCap:
+    """Tests for MAX_CONCURRENT_BACKGROUND_RENDERS."""
+
+    def test_slot_unavailable_when_cap_reached(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        alive1, alive2 = MagicMock(), MagicMock()
+        alive1.poll.return_value = None
+        alive2.poll.return_value = None
+        rm._audio_processes = {1: alive1, 2: alive2}
+        rm._background_alive = {1, 2}
+
+        assert rm._background_slot_available() is False
+
+    def test_slot_available_below_cap(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        alive1 = MagicMock()
+        alive1.poll.return_value = None
+        rm._audio_processes = {1: alive1}
+        rm._background_alive = {1}
+
+        assert rm._background_slot_available() is True
+
+    def test_prunes_a_render_that_finished(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        finished = MagicMock()
+        finished.poll.return_value = 0
+        rm._audio_processes = {1: finished}
+        rm._background_alive = {1}
+
+        assert rm._background_slot_available() is True
+        assert rm._background_alive == set()
+
+    def test_a_boosted_render_no_longer_counts_against_the_cap(self, test_prefs, tmp_path):
+        """Someone actively waiting on a pitch isn't background contention."""
+        rm = RenditionManager(test_prefs)
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+        proc1, proc2 = MagicMock(), MagicMock()
+        proc1.poll.return_value = None
+        proc2.poll.return_value = None
+        rm._audio_processes = {1: proc1, 2: proc2}
+        rm._rendering = {1, 2}
+        rm._background_alive = {1, 2}
+
+        rm._launch_render(fr, 1, background=False)  # boost, doesn't spawn (already running)
+
+        assert rm._background_alive == {2}
+        assert rm._background_slot_available() is True
+
+    def test_third_render_waits_for_a_slot_to_free_up(self, test_prefs, tmp_path):
+        """Renders 1 and 2 fill the cap; 3 must wait until one exits."""
+        rm = RenditionManager(test_prefs)
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+        rm._pending = [1, 2, 3]
+        alive_count_at_launch = []
+        poll_calls = {"n": 0}
+
+        def fake_render_one(fr_arg, semitones):
+            alive_count_at_launch.append(len(rm._background_alive))
+            proc = MagicMock()
+            if semitones == 1:
+                # Exits only after being polled a few times, simulating a
+                # background render that keeps running for a while.
+                def poll():
+                    poll_calls["n"] += 1
+                    return 0 if poll_calls["n"] > 2 else None
+
+                proc.poll.side_effect = poll
+            else:
+                proc.poll.return_value = None
+            rm._audio_processes[semitones] = proc
+            rm._background_alive.add(semitones)
+            return True
+
+        with patch.object(rm, "_render_one", side_effect=fake_render_one):
+            rm._render_remaining(fr)
+
+        assert alive_count_at_launch == [0, 1, 1]
+        assert poll_calls["n"] > 2
+
+
 class TestRenditionManagerSequentialRendering:
     """Tests for _render_remaining's queue draining."""
 
