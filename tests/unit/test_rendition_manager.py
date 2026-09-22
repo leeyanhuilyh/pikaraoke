@@ -117,6 +117,27 @@ class TestRenditionManagerStart:
         assert result.stream_url == f"/stream/{fr.stream_uid}.m3u8"
         assert (tmp_path / f"{fr.stream_uid}.m3u8").exists()
 
+    @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=True)
+    @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
+    @patch("pikaraoke.lib.rendition_manager.build_video_only_ffmpeg_cmd")
+    def test_window_renders_before_start_returns(
+        self, mock_video_cmd, mock_audio_cmd, mock_ready, test_prefs, tmp_path
+    ):
+        """BLOCK_PLAYBACK_UNTIL_WINDOW_RENDERED: the whole window is done,
+        not just queued, by the time start() hands back a stream URL."""
+        test_prefs.set("pitch_window_semitones", 2)
+        mock_video_cmd.return_value.run_async.return_value = MagicMock()
+        mock_audio_cmd.return_value.run_async.return_value = MagicMock()
+        rm = RenditionManager(test_prefs)
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+
+        result = rm.start(fr, base_semitones=0)
+
+        assert result.success is True
+        assert rm._pending == []
+        assert sorted(rm._ready) == [-2, -1, 0, 1, 2]
+        assert rm._bg_thread is None
+
     @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=False)
     @patch("pikaraoke.lib.rendition_manager.build_video_only_ffmpeg_cmd")
     def test_start_fails_if_video_never_becomes_ready(

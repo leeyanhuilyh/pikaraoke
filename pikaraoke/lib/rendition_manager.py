@@ -45,6 +45,13 @@ MIN_READY_SEGMENTS = 3
 SWITCH_LOOKAHEAD_SECONDS = 6
 SWITCH_WAIT_TIMEOUT_SECONDS = 15
 
+# Option 1 of 3 under evaluation for how pre-rendering should be paced:
+# True renders the whole window before the song starts, so song start is
+# the direct measurement of how long that takes on real hardware. False
+# only blocks on the base pitch and renders the rest in the background
+# while the song plays (the original behavior). Flip and compare.
+BLOCK_PLAYBACK_UNTIL_WINDOW_RENDERED = True
+
 
 def semitone_label(semitones: int) -> str:
     """Filename-safe token for a semitone value: p3 / m3 / p0.
@@ -224,7 +231,9 @@ class RenditionManager:
                     )
                     return True
             if time.monotonic() >= deadline:
-                logging.info(f"Pitch {semitones} not ready after {timeout:.0f}s, switching anyway")
+                logging.info(
+                    f"Pitch {semitones} not ready after {timeout:.0f}s, declining the switch"
+                )
                 return False
             time.sleep(READY_POLL_INTERVAL_SECONDS)
 
@@ -235,11 +244,12 @@ class RenditionManager:
         return proc is not None and proc.poll() == 0
 
     def start(self, fr: "FileResolver", base_semitones: int) -> PlaybackResult:
-        """Start rendering video plus the base pitch, then queue the rest of
-        the window in the background.
+        """Start rendering video plus the base pitch, then render the rest
+        of the window per BLOCK_PLAYBACK_UNTIL_WINDOW_RENDERED - either
+        before returning, or in the background while the song plays.
 
-        Blocks until video and the base pitch are ready to play - the same
-        latency shape as the legacy single-stream path.
+        Always blocks until video and the base pitch are ready to play -
+        the same latency shape as the legacy single-stream path.
         """
         from flask_babel import _
 
@@ -302,8 +312,17 @@ class RenditionManager:
                 key=lambda s: abs(s - base_semitones),
             )
         logging.info(f"Pitch pre-render: queued in background: {self._pending}")
-        self._bg_thread = Thread(target=self._render_remaining, args=(fr,), daemon=True)
-        self._bg_thread.start()
+        if BLOCK_PLAYBACK_UNTIL_WINDOW_RENDERED:
+            queued_count = len(self._pending)
+            window_started = time.monotonic()
+            self._render_remaining(fr)
+            logging.info(
+                f"Pitch pre-render: full window ({queued_count + 1} pitches incl. base) "
+                f"rendered in {time.monotonic() - window_started:.1f}s, song starting now"
+            )
+        else:
+            self._bg_thread = Thread(target=self._render_remaining, args=(fr,), daemon=True)
+            self._bg_thread.start()
 
         subtitle_url = None
         if fr.ass_file_path:
