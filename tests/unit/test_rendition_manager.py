@@ -171,7 +171,7 @@ class TestRenditionManagerStart:
 
 
 class TestRenditionManagerSequentialRendering:
-    """Tests for _render_remaining's sequential-not-concurrent guarantee."""
+    """Tests for _render_remaining's queue draining."""
 
     def test_renders_queue_in_order(self, test_prefs, tmp_path):
         rm = RenditionManager(test_prefs)
@@ -184,28 +184,34 @@ class TestRenditionManagerSequentialRendering:
             return True
 
         with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr, base_semitones=0)
+            rm._render_remaining(fr)
 
         assert call_order == [1, 2, 3]
 
-    def test_waits_for_each_render_before_starting_the_next(self, test_prefs, tmp_path):
-        """Renditions must not pile up as concurrent encodes on a Pi."""
+    def test_advances_once_a_rendition_is_ready_not_once_it_fully_finishes(
+        self, test_prefs, tmp_path
+    ):
+        """A rendition keeps encoding the rest of the song in the background
+        after it's ready - the queue must not wait for that to finish, or
+        each item ends up gated on close to the song's full runtime."""
         rm = RenditionManager(test_prefs)
         fr = _make_mock_fr(tmp_dir=str(tmp_path))
         rm._pending = [1, 2]
         events = []
 
         def fake_render_one(fr_arg, semitones):
-            events.append(f"start-{semitones}")
+            events.append(f"ready-{semitones}")
             proc = MagicMock()
-            proc.wait.side_effect = lambda: events.append(f"wait-{semitones}")
+            proc.wait.side_effect = lambda: events.append(f"finished-{semitones}")
             rm._audio_processes[semitones] = proc
             return True
 
         with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr, base_semitones=0)
+            rm._render_remaining(fr)
 
-        assert events == ["start-1", "wait-1", "start-2", "wait-2"]
+        # Both renditions are started (ready) before either is waited on to
+        # fully finish - "finished" events, if any, must not appear between them.
+        assert events == ["ready-1", "ready-2"]
 
     def test_stops_when_stop_event_set_mid_sequence(self, test_prefs, tmp_path):
         rm = RenditionManager(test_prefs)
@@ -220,7 +226,7 @@ class TestRenditionManagerSequentialRendering:
             return True
 
         with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr, base_semitones=0)
+            rm._render_remaining(fr)
 
         assert call_order == [1]
 
@@ -237,7 +243,7 @@ class TestRenditionManagerSequentialRendering:
         rm.prioritize(-2)
 
         with patch.object(rm, "_render_one", side_effect=fake_render_one):
-            rm._render_remaining(fr, base_semitones=0)
+            rm._render_remaining(fr)
 
         assert call_order == [-2, 1, -1, 2]
 

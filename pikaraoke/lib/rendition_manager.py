@@ -302,9 +302,7 @@ class RenditionManager:
                 key=lambda s: abs(s - base_semitones),
             )
         logging.info(f"Pitch pre-render: queued in background: {self._pending}")
-        self._bg_thread = Thread(
-            target=self._render_remaining, args=(fr, base_semitones), daemon=True
-        )
+        self._bg_thread = Thread(target=self._render_remaining, args=(fr,), daemon=True)
         self._bg_thread.start()
 
         subtitle_url = None
@@ -389,16 +387,18 @@ class RenditionManager:
             logging.info(f"Pitch {semitones} ready after {time.monotonic() - started:.1f}s")
         return ready
 
-    def _render_remaining(self, fr: "FileResolver", base_semitones: int) -> None:
-        """Render the rest of the pitch window in the background, one at a time.
+    def _render_remaining(self, fr: "FileResolver") -> None:
+        """Render the rest of the pitch window in the background.
 
-        Each rendition is waited out before the next starts: a Pi doesn't
-        have headroom for several concurrent encodes on top of the video
-        pipeline already driving live playback. Renditions are pulled from
-        a queue rather than a fixed list so a pitch the singer asks for can
-        jump ahead of the ones merely queued near it.
+        Each queued pitch is launched once the previous one is ready to
+        switch to - not once it has fully finished encoding, which can
+        take the length of the whole song. A rendition that's past ready
+        keeps writing in the background at low priority, so letting the
+        next one start alongside it doesn't compete with live playback;
+        that protection is what nice/ionice on background renders is for.
+        Renditions are pulled from a queue rather than a fixed list so a
+        pitch the singer asks for can jump ahead of the ones queued near it.
         """
-        self._wait_for_render(base_semitones)
         while not self._stop_event.is_set():
             with self._lock:
                 if not self._pending:
@@ -406,18 +406,6 @@ class RenditionManager:
                     return
                 semitones = self._pending.pop(0)
             self._render_one(fr, semitones)
-            self._wait_for_render(semitones)
-
-    def _wait_for_render(self, semitones: int) -> None:
-        """Block until one rendition's ffmpeg has finished writing."""
-        with self._lock:
-            proc = self._audio_processes.get(semitones)
-        if proc is None:
-            return
-        try:
-            proc.wait()
-        except Exception as e:
-            logging.debug(f"Waiting on rendition {semitones} failed: {e}")
 
     def kill_all(self) -> None:
         """Tear down every process this manager owns (video + all audio renditions)."""
