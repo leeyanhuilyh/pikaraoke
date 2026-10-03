@@ -411,11 +411,17 @@ class RenditionManager:
         """
         with self._lock:
             existing = self._audio_processes.get(semitones)
-            already_running = semitones in self._rendering and existing is not None
+            already_running = semitones in self._rendering
             if not already_running:
                 self._rendering.add(semitones)
 
         if already_running:
+            if existing is None:
+                # Another thread claimed this pitch and is still spawning its
+                # ffmpeg, which is only registered once it exists. Spawning
+                # a second one here would orphan the first, untracked and
+                # never killed, both writing the same segment files.
+                return None
             proc = existing
             if not background:
                 self._resume(semitones)

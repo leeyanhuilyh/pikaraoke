@@ -758,3 +758,19 @@ class TestRenditionManagerRunningTime:
 
         assert 1 in rm._running_since
         assert rm._running_total(1) >= 0
+
+
+class TestRenditionManagerLaunchRace:
+    """Tests for two callers racing to launch the same pitch."""
+
+    @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
+    def test_a_launch_already_in_flight_is_not_spawned_twice(self, mock_cmd, test_prefs, tmp_path):
+        """Pacing ticking while an on-demand switch is mid-spawn used to start
+        a second ffmpeg for the same pitch, orphaning the first."""
+        rm = RenditionManager(test_prefs)
+        rm._rendering = {3}  # claimed by another thread, not yet registered
+
+        result = rm._launch_render(_make_mock_fr(tmp_dir=str(tmp_path)), 3, background=True)
+
+        assert result is None
+        mock_cmd.assert_not_called()
