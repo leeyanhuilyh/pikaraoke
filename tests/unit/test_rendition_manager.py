@@ -34,6 +34,13 @@ def no_reprioritize():
         yield
 
 
+@pytest.fixture(autouse=True)
+def paced_start():
+    """Exercise the real playback path, not the temporary measurement one."""
+    with patch("pikaraoke.lib.rendition_manager.PRERENDER_WINDOW_BEFORE_PLAYBACK", False):
+        yield
+
+
 def _make_mock_fr(tmp_dir="/tmp", stream_uid=12345, ass_file_path=None, duration=180):
     mock_fr = MagicMock()
     mock_fr.tmp_dir = tmp_dir
@@ -774,3 +781,28 @@ class TestRenditionManagerLaunchRace:
 
         assert result is None
         mock_cmd.assert_not_called()
+
+
+class TestRenditionManagerPrerenderBaseline:
+    """Tests for the temporary render-everything-before-playback measurement."""
+
+    @patch("pikaraoke.lib.rendition_manager.PRERENDER_WINDOW_BEFORE_PLAYBACK", True)
+    @patch("pikaraoke.lib.rendition_manager._wait_until_ready", return_value=True)
+    @patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd")
+    @patch("pikaraoke.lib.rendition_manager.build_video_only_ffmpeg_cmd")
+    def test_every_pitch_has_finished_before_start_returns(
+        self, mock_video_cmd, mock_audio_cmd, mock_ready, test_prefs, tmp_path
+    ):
+        test_prefs.set("pitch_window_semitones", 1)
+        mock_video_cmd.return_value.run_async.return_value = MagicMock()
+        procs = [MagicMock(name=f"p{i}") for i in range(3)]
+        mock_audio_cmd.return_value.run_async.side_effect = procs
+        rm = RenditionManager(test_prefs)
+
+        result = rm.start(_make_mock_fr(tmp_dir=str(tmp_path)), base_semitones=0)
+
+        assert result.success is True
+        assert sorted(rm._ready) == [-1, 0, 1]
+        for proc in procs:
+            proc.wait.assert_called()
+        assert rm._pace_thread is None
