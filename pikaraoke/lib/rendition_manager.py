@@ -67,13 +67,6 @@ PACE_LEAD_SECONDS = 30
 PACE_MIN_LEAD_SECONDS = SWITCH_LOOKAHEAD_SECONDS + HLS_SEGMENT_SECONDS * 2
 PACE_POLL_INTERVAL_SECONDS = 0.5
 
-# Measurement only, not a mode to keep: renders the whole window before the
-# song starts, the same way the microSD baseline did (each pitch launched
-# once the previous is ready, all left running, no cap or pacing), then
-# waits for every one of them to finish the whole song. Run on an SSD, it
-# says whether storage was ever part of the cost. Remove once measured.
-PRERENDER_WINDOW_BEFORE_PLAYBACK = True
-
 
 def semitone_label(semitones: int) -> str:
     """Filename-safe token for a semitone value: p3 / m3 / p0.
@@ -386,12 +379,9 @@ class RenditionManager:
         with self._lock:
             self._position = 0
             self._window = sorted(prerendered, key=lambda s: abs(s - base_semitones))
-        if PRERENDER_WINDOW_BEFORE_PLAYBACK:
-            self._prerender_window(fr)
-        else:
-            logging.info(f"Pitch pre-render: pacing window {self._window}")
-            self._pace_thread = Thread(target=self._pace_renditions, args=(fr,), daemon=True)
-            self._pace_thread.start()
+        logging.info(f"Pitch pre-render: pacing window {self._window}")
+        self._pace_thread = Thread(target=self._pace_renditions, args=(fr,), daemon=True)
+        self._pace_thread.start()
 
         subtitle_url = None
         if fr.ass_file_path:
@@ -615,34 +605,6 @@ class RenditionManager:
                     self._launch_render(fr, semitones, background=True)
             else:
                 self._suspend(semitones)
-
-    def _prerender_window(self, fr: "FileResolver") -> None:
-        """Render every windowed pitch to completion before returning.
-
-        See PRERENDER_WINDOW_BEFORE_PLAYBACK. Logs two numbers: when the
-        last pitch became ready, which is what the microSD run measured,
-        and when the last one finished the whole song.
-        """
-        started = time.monotonic()
-        with self._lock:
-            pitches = [s for s in self._window if s != self._active]
-        logging.info(f"Pitch pre-render baseline: rendering {pitches} before playback")
-        for semitones in pitches:
-            if self._stop_event.is_set():
-                return
-            self._render_one(fr, semitones, background=True)
-        logging.info(
-            f"Pitch pre-render baseline: all {len(pitches) + 1} pitches ready "
-            f"after {time.monotonic() - started:.1f}s"
-        )
-        with self._lock:
-            processes = list(self._audio_processes.values())
-        for proc in processes:
-            proc.wait()
-        logging.info(
-            f"Pitch pre-render baseline: all {len(pitches) + 1} pitches fully rendered "
-            f"after {time.monotonic() - started:.1f}s, song starting now"
-        )
 
     def _pace_renditions(self, fr: "FileResolver") -> None:
         """Keep every windowed rendition rendered a bounded distance past
