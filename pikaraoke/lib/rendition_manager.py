@@ -56,6 +56,15 @@ SWITCH_WAIT_TIMEOUT_SECONDS = 15
 # pitch's at once. It only has to cover the gap between pacing passes plus
 # the switch lookahead, so seconds would do; 30 is slack for a stall.
 PACE_LEAD_SECONDS = 30
+# The floor every rendition is brought to before any of them is allowed to
+# build up the full lead above. A rendition is switchable as soon as it
+# covers the playhead plus the switch lookahead, so this is what actually
+# has to be true for a key change to work; the lead above is only slack.
+# Keeping these separate is what stops the window being filled one pitch
+# at a time: building a full lead on each before starting the next left
+# the last pitches in the window unrendered a minute into the song, which
+# is precisely the ones a singer was then refused.
+PACE_MIN_LEAD_SECONDS = SWITCH_LOOKAHEAD_SECONDS + HLS_SEGMENT_SECONDS * 2
 PACE_POLL_INTERVAL_SECONDS = 0.5
 
 
@@ -170,6 +179,11 @@ class RenditionManager:
         # Renditions frozen because they are far enough ahead of the
         # playhead (see _pace_renditions).
         self._suspended: set[int] = set()
+        # Time each rendition has spent actually running, and when the one
+        # currently running started, so render cost can be told apart from
+        # time spent suspended.
+        self._running_seconds: dict[int, float] = {}
+        self._running_since: dict[int, float] = {}
         # The pitch currently being listened to. Only this one has to keep
         # pace with playback, so it is the only one held at foreground
         # priority (see _set_active).
@@ -423,6 +437,9 @@ class RenditionManager:
             started = time.monotonic()
             with self._lock:
                 self._audio_processes[semitones] = proc
+                # It starts out running, so its running clock starts here
+                # rather than at the first _resume.
+                self._running_since[semitones] = started
             logging.info(
                 f"Rendering pitch {semitones} " f"({'background' if background else 'on-demand'})"
             )
@@ -441,19 +458,28 @@ class RenditionManager:
         song - separate from "ready" above, which only needs the first few
         segments. Ready times alone can't tell a slow queue from a slow
         render; this is the number that answers that.
+
+        Reports time spent actually running, not wall-clock: a paced
+        rendition is suspended for most of its life, so wall-clock measures
+        how long the song has been playing rather than what the render
+        cost, which is worse than no number at all.
         """
         exit_code = proc.wait()
         if self._stop_event.is_set():
             # A nonzero exit here is us tearing this process down on
             # purpose (e.g. a restart superseded it), not worth logging.
             return
+        running = self._running_total(semitones)
         elapsed = time.monotonic() - started
         if exit_code == 0:
-            logging.info(f"Pitch {semitones} finished rendering (full song) in {elapsed:.1f}s")
+            logging.info(
+                f"Pitch {semitones} finished rendering (full song): "
+                f"{running:.1f}s running, {elapsed:.1f}s elapsed"
+            )
         else:
             logging.debug(
                 f"Pitch {semitones} render process exited with code {exit_code} "
-                f"after {elapsed:.1f}s"
+                f"after {running:.1f}s running"
             )
 
     def _render_one(self, fr: "FileResolver", semitones: int, background: bool = True) -> bool:
@@ -488,6 +514,11 @@ class RenditionManager:
             if proc is None or semitones in self._suspended:
                 return
             self._suspended.add(semitones)
+            running_since = self._running_since.pop(semitones, None)
+            if running_since is not None:
+                self._running_seconds[semitones] = self._running_seconds.get(semitones, 0) + (
+                    time.monotonic() - running_since
+                )
         if proc.poll() is None:
             suspend_process(proc)
 
@@ -498,8 +529,19 @@ class RenditionManager:
             if proc is None or semitones not in self._suspended:
                 return
             self._suspended.discard(semitones)
+            self._running_since[semitones] = time.monotonic()
         if proc.poll() is None:
             resume_process(proc)
+
+    def _running_total(self, semitones: int) -> float:
+        """How long this rendition has actually been running, excluding the
+        time it spent suspended."""
+        with self._lock:
+            total = self._running_seconds.get(semitones, 0)
+            running_since = self._running_since.get(semitones)
+            if running_since is not None:
+                total += time.monotonic() - running_since
+            return total
 
     def _pace_order(self) -> list[int]:
         """Windowed pitches in the order they get their turn: whatever is
@@ -512,9 +554,21 @@ class RenditionManager:
             window.insert(0, active)
         return window
 
+    def _neediest(self, fr: "FileResolver", threshold: float) -> int | None:
+        """The first unfinished rendition short of `threshold` seconds of
+        audio, in the order pitches get their turn."""
+        for semitones in self._pace_order():
+            if self._is_complete(semitones):
+                continue
+            if semitones not in self._audio_processes:
+                return semitones
+            if self._rendered_seconds(fr, semitones) < threshold:
+                return semitones
+        return None
+
     def _pace_once(self, fr: "FileResolver") -> None:
-        """Give the single running slot to whichever rendition is furthest
-        behind, and freeze the rest.
+        """Give the single running slot to the rendition that needs it most,
+        and freeze the rest.
 
         Renders run several times faster than playback, so nothing needs to
         run continuously: a rendition is let go until it holds
@@ -522,17 +576,17 @@ class RenditionManager:
         one runs at a time, which is what keeps the window's cost to one
         render's worth of CPU instead of every pitch racing to the end of
         the song at once.
+
+        Being switchable comes first, for all of them, before any one of
+        them builds slack: a rendition still short of PACE_MIN_LEAD_SECONDS
+        cannot be switched to at all, so it outranks one that is merely
+        below its full lead. Without that split the window filled strictly
+        in order, and the pitches at the end of it were still unrendered a
+        minute into the song.
         """
-        target = self._position + PACE_LEAD_SECONDS
-        runner = None
-        for semitones in self._pace_order():
-            if self._is_complete(semitones):
-                continue
-            if semitones not in self._audio_processes or self._rendered_seconds(fr, semitones) < (
-                target
-            ):
-                runner = semitones
-                break
+        runner = self._neediest(fr, self._position + PACE_MIN_LEAD_SECONDS)
+        if runner is None:
+            runner = self._neediest(fr, self._position + PACE_LEAD_SECONDS)
 
         awaited = self._awaited
         for semitones in self._pace_order():
@@ -562,6 +616,8 @@ class RenditionManager:
             self._ready.clear()
             self._rendering.clear()
             self._suspended.clear()
+            self._running_seconds.clear()
+            self._running_since.clear()
             self._active = None
             self._awaited = None
             self._declared = []

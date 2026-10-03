@@ -1,5 +1,6 @@
 """Unit tests for rendition_manager module."""
 
+import time
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -8,6 +9,7 @@ from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.rendition_manager import (
     MAX_SEMITONES,
     MIN_SEMITONES,
+    PACE_MIN_LEAD_SECONDS,
     RenditionManager,
     audio_playlist_path,
     build_master_playlist,
@@ -636,3 +638,123 @@ class TestRenditionManagerSuspendResume:
 
         mock_resume.assert_called_once_with(proc)
         assert rm._suspended == set()
+
+
+class TestRenditionManagerPacingFairness:
+    """Tests for the switchable-first rule in _pace_once.
+
+    The bug these exist for: pacing used to bring one rendition all the way
+    up to its full lead before starting the next, so the pitches at the end
+    of the window were still unrendered a minute into the song - and those
+    are exactly the ones a singer got refused.
+    """
+
+    @staticmethod
+    def _rm(prefs, window, rendered):
+        rm = RenditionManager(prefs)
+        rm._window = list(window)
+        rm._audio_processes = {s: MagicMock(**{"poll.return_value": None}) for s in rendered}
+        rm._rendering = set(rendered)
+        rm._rendered_seconds = lambda fr, s: rendered[s]
+        return rm
+
+    def test_an_unswitchable_pitch_outranks_one_merely_short_of_its_lead(
+        self, test_prefs, tmp_path
+    ):
+        """Pitch -1 has enough to switch to and just lacks slack; pitch 1 has
+        nothing. Pitch 1 has to go first or it cannot be switched to at all."""
+        rm = self._rm(test_prefs, [0, -1, 1], {0: 300, -1: 20, 1: 0})
+        rm._position = 5
+
+        with (
+            patch.object(rm, "_suspend") as mock_suspend,
+            patch.object(rm, "_resume") as mock_resume,
+        ):
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        mock_resume.assert_called_once_with(1)
+        assert -1 in {c.args[0] for c in mock_suspend.call_args_list}
+
+    def test_every_pitch_becomes_switchable_before_any_builds_slack(self, test_prefs, tmp_path):
+        """Walk pacing forward over a cold window and check the order it
+        fills: everything crosses the switchable floor before anything goes
+        on to build the full lead."""
+        window = [0, -1, 1, -2, 2]
+        rendered = {s: 0.0 for s in window}
+        rm = self._rm(test_prefs, window, rendered)
+        rm._rendered_seconds = lambda fr, s: rendered[s]
+        rm._position = 0
+        fr = _make_mock_fr(tmp_dir=str(tmp_path))
+
+        floor = rm._position + PACE_MIN_LEAD_SECONDS
+        reached_floor: list[int] = []
+        for _tick in range(400):
+            runner = rm._neediest(fr, floor) or rm._neediest(fr, rm._position + 30)
+            if runner is None:
+                break
+            # One slice of rendering, far faster than realtime as on real
+            # hardware, then note anything that just crossed the floor.
+            rendered[runner] += 3
+            for s in window:
+                if rendered[s] >= floor and s not in reached_floor:
+                    reached_floor.append(s)
+            if len(reached_floor) == len(window):
+                break
+
+        assert sorted(reached_floor) == sorted(window)
+        # Nothing ran away with a big lead while others sat at zero.
+        assert max(rendered.values()) - min(rendered.values()) <= PACE_MIN_LEAD_SECONDS
+
+    def test_the_playing_pitch_still_outranks_an_unswitchable_one(self, test_prefs, tmp_path):
+        """Switchable-first must not demote what is actually playing: if that
+        falls behind the playhead the song itself stalls."""
+        rm = self._rm(test_prefs, [0, 1], {0: 0, 1: 0})
+        rm._position = 60
+        rm._active = 1
+
+        with patch.object(rm, "_suspend"), patch.object(rm, "_resume") as mock_resume:
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        mock_resume.assert_called_once_with(1)
+
+    def test_lead_building_resumes_once_everything_is_switchable(self, test_prefs, tmp_path):
+        """With all of them past the floor, the slot goes back to topping up
+        leads in nearest-the-key order."""
+        rm = self._rm(test_prefs, [0, -1, 1], {0: 20, -1: 20, 1: 20})
+        rm._position = 0
+
+        with patch.object(rm, "_suspend"), patch.object(rm, "_resume") as mock_resume:
+            rm._pace_once(_make_mock_fr(tmp_dir=str(tmp_path)))
+
+        mock_resume.assert_called_once_with(0)
+
+
+class TestRenditionManagerRunningTime:
+    """Tests for telling render cost apart from time spent suspended."""
+
+    def test_running_total_excludes_suspended_time(self, test_prefs):
+        rm = RenditionManager(test_prefs)
+        rm._audio_processes = {1: MagicMock(**{"poll.return_value": None})}
+        rm._suspended = {1}
+
+        with patch("pikaraoke.lib.rendition_manager.resume_process"):
+            rm._resume(1)
+        rm._running_since[1] = time.monotonic() - 5  # pretend it ran 5s
+        with patch("pikaraoke.lib.rendition_manager.suspend_process"):
+            rm._suspend(1)
+
+        frozen_total = rm._running_total(1)
+        time.sleep(0.05)
+
+        assert 5 <= frozen_total < 6
+        # Still suspended, so the total must not have moved on.
+        assert rm._running_total(1) == frozen_total
+
+    def test_a_launched_rendition_starts_its_running_clock(self, test_prefs, tmp_path):
+        with patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd") as mock_cmd:
+            mock_cmd.return_value.run_async.return_value = MagicMock()
+            rm = RenditionManager(test_prefs)
+            rm._launch_render(_make_mock_fr(tmp_dir=str(tmp_path)), 1)
+
+        assert 1 in rm._running_since
+        assert rm._running_total(1) >= 0
