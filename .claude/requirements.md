@@ -22,6 +22,10 @@ Live, non-restart pitch changing via ffmpeg's azmq control socket driving an alw
 
 Restart-based: transpose requeues the current song with the new pitch and resumes ffmpeg from the last playback position, meeting the 5-second requirement (~3s in practice). Debugging surfaced four distinct bugs from the restart itself corrupting client state (a skip-triggered video hide blocking a since-added freeze-frame overlay, two separate stale-position races that made the new stream seek past segments it hadn't generated yet, and an unguarded subtitle-worker teardown that could silently abort the whole swap) - all fixed. Two issues remain open: audio/video sync after a transpose is inconsistent between runs at the same semitone shift (not a fixed offset, so not fixable via the avsync setting), and a mid-song crash observed on at least one song with no confirmed root cause yet. Both are suspected to share the same underlying cause as the fixed bugs - ffmpeg isn't paced to real time on this branch - but that fix was deliberately not applied since it would erode the restart-speed advantage that motivated this approach.
 
+##### pitch-render-pi-perf
+
+Pre-rendered audio-track switching (the approach merged from audio-track-switch-poc) made usable on a Raspberry Pi 4. Every key in +/-6 is rendered as its own audio-only HLS rendition, shifted by resampling plus atempo and encoded as 16-bit FLAC, about 30x faster than playback on a Pi 4 against 6x for the rubberband + AAC it replaces. Renders are paced: one runs at a time, each kept just ahead of the playhead and frozen otherwise, every key made switchable before any builds extra lead. On device, song start takes about 2s, nearby keys switch near-instantly and the furthest within a few seconds, meeting the 5-second requirement. FLAC costs about 430MB per five-minute song across all keys, so on a 2GB Pi whose /tmp is RAM-backed the app should be started with TMPDIR on disk. Measurements along the way ruled out storage speed (SSD vs microSD made no difference) and rubberband tuning as levers.
+
 ### Vocal track toggle
 
 #### User story

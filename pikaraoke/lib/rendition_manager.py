@@ -23,6 +23,12 @@ from pikaraoke.lib.ffmpeg import (
     build_video_only_ffmpeg_cmd,
 )
 from pikaraoke.lib.preference_manager import PreferenceManager
+from pikaraoke.lib.process_priority import (
+    lower_priority,
+    restore_priority,
+    resume_process,
+    suspend_process,
+)
 from pikaraoke.lib.stream_manager import PlaybackResult
 from pikaraoke.lib.url_prefix import normalize_url_base_path
 
@@ -43,6 +49,23 @@ MIN_READY_SEGMENTS = 3
 # something buffered ahead and doesn't stall the moment it switches.
 SWITCH_LOOKAHEAD_SECONDS = 6
 SWITCH_WAIT_TIMEOUT_SECONDS = 15
+
+# How far past the playhead a rendition is kept rendered. Anything with
+# this much audio in hand is suspended outright until the playhead catches
+# up, so the window costs one render's worth of CPU rather than every
+# pitch's at once. It only has to cover the gap between pacing passes plus
+# the switch lookahead, so seconds would do; 30 is slack for a stall.
+PACE_LEAD_SECONDS = 30
+# The floor every rendition is brought to before any of them is allowed to
+# build up the full lead above. A rendition is switchable as soon as it
+# covers the playhead plus the switch lookahead, so this is what actually
+# has to be true for a key change to work; the lead above is only slack.
+# Keeping these separate is what stops the window being filled one pitch
+# at a time: building a full lead on each before starting the next left
+# the last pitches in the window unrendered a minute into the song, which
+# is precisely the ones a singer was then refused.
+PACE_MIN_LEAD_SECONDS = SWITCH_LOOKAHEAD_SECONDS + HLS_SEGMENT_SECONDS * 2
+PACE_POLL_INTERVAL_SECONDS = 0.5
 
 
 def semitone_label(semitones: int) -> str:
@@ -77,23 +100,35 @@ def build_master_playlist(fr: "FileResolver", offsets: list[int], base_semitones
             f"DEFAULT={default},AUTOSELECT=YES,"
             f'URI="{fr.stream_uid}_audio_{semitone_label(s)}.m3u8"'
         )
-    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS="avc1.640028,mp4a.40.2",AUDIO="audio"')
+    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS="avc1.640028,fLaC",AUDIO="audio"')
     lines.append(f"{fr.stream_uid}_video.m3u8")
     return "\n".join(lines) + "\n"
 
 
-def _terminate(proc: subprocess.Popen | None, timeout: float = 5) -> None:
-    """Terminate a process gracefully, escalating to SIGKILL if it won't stop."""
-    if proc is None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-    except Exception as e:
-        logging.debug(f"Process termination exception: {e}")
+def _terminate_all(processes: list[subprocess.Popen], timeout: float = 5) -> None:
+    """Terminate processes gracefully, escalating to SIGKILL for any still
+    running at a deadline they all share.
+
+    Signalled together rather than one terminate-and-wait at a time: a song
+    owns a dozen or more renditions, and waiting each one out in turn made
+    teardown take seconds that the next song then had to wait for.
+    """
+    for proc in processes:
+        # A suspended process never gets round to handling SIGTERM, so it
+        # would sit out the timeout below. Deliberately outside the try: if
+        # this were inside, a failure here would skip the terminate.
+        resume_process(proc)
+        try:
+            proc.terminate()
+        except OSError as e:
+            logging.debug(f"Process termination exception: {e}")
+    deadline = time.monotonic() + timeout
+    for proc in processes:
+        try:
+            proc.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def _count_segments(tmp_dir: str, marker: str) -> int:
@@ -146,12 +181,30 @@ class RenditionManager:
         self._audio_processes: dict[int, subprocess.Popen] = {}
         self._ready: set[int] = set()
         self._rendering: set[int] = set()
+        # Renditions frozen because they are far enough ahead of the
+        # playhead (see _pace_renditions).
+        self._suspended: set[int] = set()
+        # Time each rendition has spent actually running, and when the one
+        # currently running started, so render cost can be told apart from
+        # time spent suspended.
+        self._running_seconds: dict[int, float] = {}
+        self._running_since: dict[int, float] = {}
+        # The pitch currently being listened to. Only this one has to keep
+        # pace with playback, so it is the only one held at foreground
+        # priority (see _set_active).
+        self._active: int | None = None
+        # The pitch a caller is blocked on right now, which pacing must
+        # leave running however far ahead it already is.
+        self._awaited: int | None = None
         self._declared: list[int] = []
-        self._pending: list[int] = []
+        # Pitches kept pre-rendered ahead of the playhead, nearest the
+        # starting key first.
+        self._window: list[int] = []
+        self._position: float = 0
         self._fr: "FileResolver | None" = None
         self._lock = Lock()
         self._stop_event = Event()
-        self._bg_thread: Thread | None = None
+        self._pace_thread: Thread | None = None
 
     def _with_base_path(self, path: str) -> str:
         return f"{self.base_path}{path}" if self.base_path else path
@@ -171,12 +224,10 @@ class RenditionManager:
         with self._lock:
             return semitones in self._declared
 
-    def prioritize(self, semitones: int) -> None:
-        """Move a queued pitch to the front so it renders next."""
-        with self._lock:
-            if semitones in self._pending:
-                self._pending.remove(semitones)
-                self._pending.insert(0, semitones)
+    def note_position(self, position: float) -> None:
+        """Feed pacing the live playhead, so it knows how far ahead each
+        rendition needs to be kept."""
+        self._position = position
 
     def ensure_switchable(
         self,
@@ -201,26 +252,64 @@ class RenditionManager:
         # Pre-rendering only covers a window around the starting key, so a
         # pitch outside it has nothing running yet and nothing queued to
         # wait for - start it here rather than leave the caller waiting on
-        # a render that would never happen.
-        self.prioritize(semitones)
-        self._launch_render(fr, semitones)
-        marker = f"{fr.stream_uid}_audio_{semitone_label(semitones)}_"
-        playlist = audio_playlist_path(fr, semitones)
-        needed = int((position + SWITCH_LOOKAHEAD_SECONDS) // HLS_SEGMENT_SECONDS) + 1
+        # a render that would never happen. Claiming it first stops pacing
+        # suspending it back out from under this wait.
+        with self._lock:
+            self._awaited = semitones
+        try:
+            started = time.monotonic()
+            self._launch_render(fr, semitones, background=False)
+            marker = f"{fr.stream_uid}_audio_{semitone_label(semitones)}_"
+            playlist = audio_playlist_path(fr, semitones)
+            needed = int((position + SWITCH_LOOKAHEAD_SECONDS) // HLS_SEGMENT_SECONDS) + 1
 
-        deadline = time.monotonic() + timeout
-        while True:
-            if self._stop_event.is_set():
-                return False
-            if os.path.exists(playlist):
-                # A finished rendition counts even if it has fewer segments
-                # than the playhead implies - near the end of a song there
-                # simply aren't any more to wait for.
-                if _count_segments(fr.tmp_dir, marker) >= needed or self._is_complete(semitones):
-                    return True
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(READY_POLL_INTERVAL_SECONDS)
+            deadline = time.monotonic() + timeout
+            while True:
+                if self._stop_event.is_set():
+                    return False
+                if os.path.exists(playlist):
+                    # A finished rendition counts even if it has fewer
+                    # segments than the playhead implies - near the end of a
+                    # song there simply aren't any more to wait for.
+                    if _count_segments(fr.tmp_dir, marker) >= needed or self._is_complete(
+                        semitones
+                    ):
+                        logging.info(
+                            f"Pitch {semitones} switchable after "
+                            f"{time.monotonic() - started:.1f}s"
+                        )
+                        self._set_active(semitones)
+                        return True
+                if time.monotonic() >= deadline:
+                    logging.info(
+                        f"Pitch {semitones} not ready after {timeout:.0f}s, declining the switch"
+                    )
+                    return False
+                time.sleep(READY_POLL_INTERVAL_SECONDS)
+        finally:
+            with self._lock:
+                if self._awaited == semitones:
+                    self._awaited = None
+
+    def _set_active(self, semitones: int) -> None:
+        """Make one pitch the foreground render and push every other one down.
+
+        Only the pitch being listened to has to keep pace with playback; the
+        rest are discretionary. Without this sweep, stepping through keys
+        leaves every pitch touched on the way at foreground priority,
+        competing with the one actually playing - six quick steps means six
+        rivals, which is enough to starve a later on-demand render.
+        """
+        with self._lock:
+            self._active = semitones
+            processes = dict(self._audio_processes)
+        for pitch, proc in processes.items():
+            if proc.poll() is not None:
+                continue
+            if pitch == semitones:
+                restore_priority(proc)
+            else:
+                lower_priority(proc)
 
     def _is_complete(self, semitones: int) -> bool:
         """Whether this rendition's ffmpeg finished writing successfully."""
@@ -229,11 +318,13 @@ class RenditionManager:
         return proc is not None and proc.poll() == 0
 
     def start(self, fr: "FileResolver", base_semitones: int) -> PlaybackResult:
-        """Start rendering video plus the base pitch, then queue the rest of
-        the window in the background.
+        """Start rendering video plus the base pitch, then keep the rest of
+        the window paced ahead of the playhead while the song plays.
 
-        Blocks until video and the base pitch are ready to play - the same
-        latency shape as the legacy single-stream path.
+        Blocks only until video and the base pitch are ready to play - the
+        same latency shape as the legacy single-stream path. The other
+        windowed pitches are rendered by the pacing loop, which keeps them
+        ahead of playback without racing them to the end of the song.
         """
         from flask_babel import _
 
@@ -255,6 +346,10 @@ class RenditionManager:
             self._fr = fr
             self._declared = declared
 
+        logging.info(
+            f"Pitch pre-render: base={base_semitones}, window=±{window}, " f"declared={declared}"
+        )
+
         video_cmd = build_video_only_ffmpeg_cmd(
             fr,
             video_playlist_path(fr),
@@ -274,9 +369,10 @@ class RenditionManager:
             self.kill_all()
             return PlaybackResult(success=False, error=_("Failed to prepare video stream"))
 
-        if not self._render_one(fr, base_semitones):
+        if not self._render_one(fr, base_semitones, background=False):
             self.kill_all()
             return PlaybackResult(success=False, error=_("Failed to prepare audio stream"))
+        self._set_active(base_semitones)
 
         master_path = f"{fr.tmp_dir}/{fr.stream_uid}.m3u8"
         with open(master_path, "w") as f:
@@ -284,17 +380,13 @@ class RenditionManager:
 
         # Nearest-to-base first: singers nudge the key a step at a time
         # rather than jumping to the edge of the range, so the pitches most
-        # likely to be picked next are ready soonest. A pitch the singer
-        # actually asks for jumps this queue (see prioritize).
+        # likely to be picked next get their turn soonest.
         with self._lock:
-            self._pending = sorted(
-                (s for s in prerendered if s != base_semitones),
-                key=lambda s: abs(s - base_semitones),
-            )
-        self._bg_thread = Thread(
-            target=self._render_remaining, args=(fr, base_semitones), daemon=True
-        )
-        self._bg_thread.start()
+            self._position = 0
+            self._window = sorted(prerendered, key=lambda s: abs(s - base_semitones))
+        logging.info(f"Pitch pre-render: pacing window {self._window}")
+        self._pace_thread = Thread(target=self._pace_renditions, args=(fr,), daemon=True)
+        self._pace_thread.start()
 
         subtitle_url = None
         if fr.ass_file_path:
@@ -307,41 +399,105 @@ class RenditionManager:
             duration=fr.duration,
         )
 
-    def _launch_render(self, fr: "FileResolver", semitones: int) -> subprocess.Popen | None:
+    def _launch_render(
+        self, fr: "FileResolver", semitones: int, background: bool = True
+    ) -> subprocess.Popen | None:
         """Start one rendition's ffmpeg, unless it is already running.
 
-        Safe to call from both the background queue and an on-demand
-        switch, which can race for the same pitch.
+        Safe to call from both pacing and an on-demand switch, which can
+        race for the same pitch. `background` sets this process's OS
+        scheduling priority every time this is called for it, whether it
+        was just started or was already running - so a render pacing
+        started gets bumped back to normal priority the moment someone
+        actually asks for that pitch, rather than staying deprioritized
+        while they wait on it. An already-running render that pacing
+        suspended is resumed here, since a caller asking for it needs it
+        making progress, not frozen.
         """
         with self._lock:
             existing = self._audio_processes.get(semitones)
-            if semitones in self._rendering and existing is not None:
-                return existing
-            self._rendering.add(semitones)
-            if semitones in self._pending:
-                self._pending.remove(semitones)
+            already_running = semitones in self._rendering
+            if not already_running:
+                self._rendering.add(semitones)
 
-        normalize_audio = self.preferences.get_or_default("normalize_audio")
-        avsync = self.preferences.get_or_default("avsync")
-        label = semitone_label(semitones)
-        cmd = build_audio_only_ffmpeg_cmd(
-            fr,
-            semitones,
-            audio_playlist_path(fr, semitones),
-            f"{fr.tmp_dir}/{fr.stream_uid}_audio_{label}_segment_%03d.m4s",
-            f"{fr.stream_uid}_audio_{label}_init.mp4",
-            normalize_audio,
-            avsync,
-        )
-        proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
-        with self._lock:
-            self._audio_processes[semitones] = proc
+        if already_running:
+            if existing is None:
+                # Another thread claimed this pitch and is still spawning its
+                # ffmpeg, which is only registered once it exists. Spawning
+                # a second one here would orphan the first, untracked and
+                # never killed, both writing the same segment files.
+                return None
+            proc = existing
+            if not background:
+                self._resume(semitones)
+                logging.info(f"Pitch {semitones} already rendering, prioritizing it")
+        else:
+            normalize_audio = self.preferences.get_or_default("normalize_audio")
+            avsync = self.preferences.get_or_default("avsync")
+            label = semitone_label(semitones)
+            cmd = build_audio_only_ffmpeg_cmd(
+                fr,
+                semitones,
+                audio_playlist_path(fr, semitones),
+                f"{fr.tmp_dir}/{fr.stream_uid}_audio_{label}_segment_%03d.m4s",
+                f"{fr.stream_uid}_audio_{label}_init.mp4",
+                normalize_audio,
+                avsync,
+            )
+            proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
+            started = time.monotonic()
+            with self._lock:
+                self._audio_processes[semitones] = proc
+                # It starts out running, so its running clock starts here
+                # rather than at the first _resume.
+                self._running_since[semitones] = started
+            logging.info(
+                f"Rendering pitch {semitones} " f"({'background' if background else 'on-demand'})"
+            )
+            Thread(
+                target=self._log_full_completion, args=(semitones, proc, started), daemon=True
+            ).start()
+
+        if background:
+            lower_priority(proc)
+        else:
+            restore_priority(proc)
         return proc
 
-    def _render_one(self, fr: "FileResolver", semitones: int) -> bool:
+    def _log_full_completion(self, semitones: int, proc: subprocess.Popen, started: float) -> None:
+        """Log when a rendition's ffmpeg actually finishes writing the whole
+        song - separate from "ready" above, which only needs the first few
+        segments. Ready times alone can't tell a slow queue from a slow
+        render; this is the number that answers that.
+
+        Reports time spent actually running, not wall-clock: a paced
+        rendition is suspended for most of its life, so wall-clock measures
+        how long the song has been playing rather than what the render
+        cost, which is worse than no number at all.
+        """
+        exit_code = proc.wait()
+        if self._stop_event.is_set():
+            # A nonzero exit here is us tearing this process down on
+            # purpose (e.g. a restart superseded it), not worth logging.
+            return
+        running = self._running_total(semitones)
+        elapsed = time.monotonic() - started
+        if exit_code == 0:
+            logging.info(
+                f"Pitch {semitones} finished rendering (full song): "
+                f"{running:.1f}s running, {elapsed:.1f}s elapsed"
+            )
+        else:
+            logging.debug(
+                f"Pitch {semitones} render process exited with code {exit_code} "
+                f"after {running:.1f}s running"
+            )
+
+    def _render_one(self, fr: "FileResolver", semitones: int, background: bool = True) -> bool:
         """Render one audio-only rendition and mark it ready to play from."""
         label = semitone_label(semitones)
-        proc = self._launch_render(fr, semitones)
+        started = time.monotonic()
+        proc = self._launch_render(fr, semitones, background)
         if proc is None:
             return False
         ready = _wait_until_ready(
@@ -354,36 +510,113 @@ class RenditionManager:
         if ready:
             with self._lock:
                 self._ready.add(semitones)
+            logging.info(f"Pitch {semitones} ready after {time.monotonic() - started:.1f}s")
         return ready
 
-    def _render_remaining(self, fr: "FileResolver", base_semitones: int) -> None:
-        """Render the rest of the pitch window in the background, one at a time.
+    def _rendered_seconds(self, fr: "FileResolver", semitones: int) -> float:
+        """Roughly how much audio a rendition has on disk, from its segment count."""
+        marker = f"{fr.stream_uid}_audio_{semitone_label(semitones)}_"
+        return _count_segments(fr.tmp_dir, marker) * HLS_SEGMENT_SECONDS
 
-        Each rendition is waited out before the next starts: a Pi doesn't
-        have headroom for several concurrent encodes on top of the video
-        pipeline already driving live playback. Renditions are pulled from
-        a queue rather than a fixed list so a pitch the singer asks for can
-        jump ahead of the ones merely queued near it.
-        """
-        self._wait_for_render(base_semitones)
-        while not self._stop_event.is_set():
-            with self._lock:
-                if not self._pending:
-                    return
-                semitones = self._pending.pop(0)
-            self._render_one(fr, semitones)
-            self._wait_for_render(semitones)
-
-    def _wait_for_render(self, semitones: int) -> None:
-        """Block until one rendition's ffmpeg has finished writing."""
+    def _suspend(self, semitones: int) -> None:
+        """Freeze a rendition that is far enough ahead of the playhead."""
         with self._lock:
             proc = self._audio_processes.get(semitones)
-        if proc is None:
-            return
-        try:
-            proc.wait()
-        except Exception as e:
-            logging.debug(f"Waiting on rendition {semitones} failed: {e}")
+            if proc is None or semitones in self._suspended:
+                return
+            self._suspended.add(semitones)
+            running_since = self._running_since.pop(semitones, None)
+            if running_since is not None:
+                self._running_seconds[semitones] = self._running_seconds.get(semitones, 0) + (
+                    time.monotonic() - running_since
+                )
+        if proc.poll() is None:
+            suspend_process(proc)
+
+    def _resume(self, semitones: int) -> None:
+        """Let a frozen rendition carry on from where it was suspended."""
+        with self._lock:
+            proc = self._audio_processes.get(semitones)
+            if proc is None or semitones not in self._suspended:
+                return
+            self._suspended.discard(semitones)
+            self._running_since[semitones] = time.monotonic()
+        if proc.poll() is None:
+            resume_process(proc)
+
+    def _running_total(self, semitones: int) -> float:
+        """How long this rendition has actually been running, excluding the
+        time it spent suspended."""
+        with self._lock:
+            total = self._running_seconds.get(semitones, 0)
+            running_since = self._running_since.get(semitones)
+            if running_since is not None:
+                total += time.monotonic() - running_since
+            return total
+
+    def _pace_order(self) -> list[int]:
+        """Windowed pitches in the order they get their turn: whatever is
+        playing first, since that one must never fall behind the playhead."""
+        with self._lock:
+            window = list(self._window)
+            active = self._active
+        if active in window:
+            window.remove(active)
+            window.insert(0, active)
+        return window
+
+    def _neediest(self, fr: "FileResolver", threshold: float) -> int | None:
+        """The first unfinished rendition short of `threshold` seconds of
+        audio, in the order pitches get their turn."""
+        for semitones in self._pace_order():
+            if self._is_complete(semitones):
+                continue
+            if semitones not in self._audio_processes:
+                return semitones
+            if self._rendered_seconds(fr, semitones) < threshold:
+                return semitones
+        return None
+
+    def _pace_once(self, fr: "FileResolver") -> None:
+        """Give the single running slot to the rendition that needs it most,
+        and freeze the rest.
+
+        Renders run several times faster than playback, so nothing needs to
+        run continuously: a rendition is let go until it holds
+        PACE_LEAD_SECONDS past the playhead, then suspended outright. Only
+        one runs at a time, which is what keeps the window's cost to one
+        render's worth of CPU instead of every pitch racing to the end of
+        the song at once.
+
+        Being switchable comes first, for all of them, before any one of
+        them builds slack: a rendition still short of PACE_MIN_LEAD_SECONDS
+        cannot be switched to at all, so it outranks one that is merely
+        below its full lead. Without that split the window filled strictly
+        in order, and the pitches at the end of it were still unrendered a
+        minute into the song.
+        """
+        runner = self._neediest(fr, self._position + PACE_MIN_LEAD_SECONDS)
+        if runner is None:
+            runner = self._neediest(fr, self._position + PACE_LEAD_SECONDS)
+
+        awaited = self._awaited
+        for semitones in self._pace_order():
+            # A pitch someone is blocked on keeps running however far ahead
+            # it is - the wait is on it covering the playhead right now.
+            if semitones == runner or semitones == awaited:
+                if semitones in self._audio_processes:
+                    self._resume(semitones)
+                else:
+                    self._launch_render(fr, semitones, background=True)
+            else:
+                self._suspend(semitones)
+
+    def _pace_renditions(self, fr: "FileResolver") -> None:
+        """Keep every windowed rendition rendered a bounded distance past
+        the playhead for as long as the song is playing."""
+        while not self._stop_event.is_set():
+            self._pace_once(fr)
+            time.sleep(PACE_POLL_INTERVAL_SECONDS)
 
     def kill_all(self) -> None:
         """Tear down every process this manager owns (video + all audio renditions)."""
@@ -393,13 +626,17 @@ class RenditionManager:
             self._audio_processes.clear()
             self._ready.clear()
             self._rendering.clear()
+            self._suspended.clear()
+            self._running_seconds.clear()
+            self._running_since.clear()
+            self._active = None
+            self._awaited = None
             self._declared = []
-            self._pending = []
+            self._window = []
+            self._position = 0
             self._fr = None
             video_process = self._video_process
             self._video_process = None
-        _terminate(video_process)
-        for proc in audio_processes:
-            _terminate(proc)
-        if self._bg_thread and self._bg_thread.is_alive():
-            self._bg_thread.join(timeout=1)
+        _terminate_all([p for p in (video_process, *audio_processes) if p is not None])
+        if self._pace_thread and self._pace_thread.is_alive():
+            self._pace_thread.join(timeout=1)

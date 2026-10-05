@@ -432,8 +432,9 @@ class TestFastTranspose:
         k = mock_karaoke_with_songs
         self._start_playing(k)
 
-        k.fast_transpose(3)
+        result = k.fast_transpose(3)
 
+        assert result is True
         assert k.playback_controller.now_playing_transpose == 3
         # No skip/restart: the song keeps playing under the same filename.
         assert k.playback_controller.skipped_reasons == []
@@ -448,6 +449,32 @@ class TestFastTranspose:
         k.fast_transpose(3)
 
         assert emitted == [True]
+
+    def test_declines_without_changing_pitch_when_not_caught_up(self, mock_karaoke_with_songs):
+        """Forcing the switch would tell the player to jump to a track with no
+        segment at the current position, which stalls it with no recovery -
+        must leave the current pitch playing instead."""
+        k = mock_karaoke_with_songs
+        self._start_playing(k)
+        k.playback_controller.now_playing_transpose = 0
+        k.playback_controller.prepare_pitch_switch = lambda semitones: False
+
+        result = k.fast_transpose(3)
+
+        assert result is False
+        assert k.playback_controller.now_playing_transpose == 0
+        assert k.playback_controller.skipped_reasons == []
+
+    def test_declining_does_not_emit_now_playing_update(self, mock_karaoke_with_songs):
+        k = mock_karaoke_with_songs
+        self._start_playing(k)
+        k.playback_controller.prepare_pitch_switch = lambda semitones: False
+        emitted = []
+        k.events.on("now_playing_update", lambda: emitted.append(True))
+
+        k.fast_transpose(3)
+
+        assert emitted == []
 
 
 class TestRegisterDownloadedSong:

@@ -565,23 +565,30 @@ class Karaoke:
         self.log_and_send(_("Transposing by %s semitones: %s") % (semitones, now_playing))
         self.playback_controller.skip(log_action=False, reason="transpose")
 
-    def fast_transpose(self, semitones: int) -> None:
+    def fast_transpose(self, semitones: int) -> bool:
         """Switch to an already pre-rendered pitch without restarting playback.
 
         Args:
             semitones: Number of semitones to transpose. Must be inside the
                 current song's pre-render window - callers should check
                 playback_controller.can_fast_switch(semitones) first.
+
+        Returns:
+            True if the switch happened. False if the rendition hasn't
+            caught up to the current playback position yet, and the
+            current pitch keeps playing unchanged - switching the player
+            to a track with no segment at the current position stalls it
+            with no way to recover, so this declines rather than risk that.
         """
-        # Renders it next if it hasn't been reached yet. Even if this times
-        # out we still switch rather than restart: the player polls the
-        # rendition's playlist as it grows.
         if not self.playback_controller.prepare_pitch_switch(semitones):
-            logging.debug(f"Pitch {semitones} not fully buffered yet, switching anyway")
+            # MSG: Message shown when a key change couldn't be prepared in time
+            self.log_and_send(_("Still preparing that key, try again in a moment"), "warning")
+            return False
         self.playback_controller.now_playing_transpose = semitones
         # MSG: Message shown after a key change that didn't need to restart the song
         self.log_and_send(_("Changed key to %s semitones") % semitones)
         self.events.emit("now_playing_update")
+        return True
 
     def volume_change(self, vol_level: float) -> bool:
         """Set the volume level.

@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+from threading import Lock
 from typing import TYPE_CHECKING, Callable
 
 from flask_babel import _
@@ -75,6 +76,10 @@ class PlaybackController:
         self.stream_manager = StreamManager(preferences, streaming_format, base_path)
         self.rendition_manager = RenditionManager(preferences, base_path)
         self._using_rendition_manager = False
+        # Held while a finished song's processes are stopped and the shared
+        # temp directory is deleted, so the next song can't start writing
+        # into a directory that is about to disappear (see end_song).
+        self._teardown_lock = Lock()
 
     @property
     def ffmpeg_process(self) -> "subprocess.Popen | None":
@@ -105,6 +110,10 @@ class PlaybackController:
         )
 
         self.claim(file_path)
+        # A previous song's teardown may still be running; wait it out so it
+        # can't delete the temp directory from under this one.
+        with self._teardown_lock:
+            pass
 
         use_rendition_manager = (
             self.stream_manager.streaming_format == "hls"
@@ -187,14 +196,20 @@ class PlaybackController:
                 self.events.emit("notification", _("Song ended abnormally: %s") % reason, "danger")
 
         self.reset_now_playing()
-        if self._using_rendition_manager:
-            self.rendition_manager.kill_all()
-        else:
-            self.stream_manager.kill_ffmpeg()
-        # Small delay to ensure FFmpeg fully terminates and file handles close
-        # Critical on Raspberry Pi with slow SD cards and hardware encoder cleanup
-        time.sleep(0.3)
-        delete_tmp_dir()
+        # The temp directory is shared by every song, and marking this one
+        # ended above is what lets the run loop start the next. Every wait
+        # below yields to it under gevent, so without the lock a slow
+        # teardown deleted the directory the next song had just started
+        # writing into, and its ffmpeg failed with "no such file".
+        with self._teardown_lock:
+            if self._using_rendition_manager:
+                self.rendition_manager.kill_all()
+            else:
+                self.stream_manager.kill_ffmpeg()
+            # Small delay to ensure FFmpeg fully terminates and file handles close
+            # Critical on Raspberry Pi with slow SD cards and hardware encoder cleanup
+            time.sleep(0.3)
+            delete_tmp_dir()
         logging.debug("Cleanup complete")
 
         self.events.emit("song_ended", reason)
@@ -241,6 +256,17 @@ class PlaybackController:
         else:
             logging.warning("Tried to pause, but no file is playing!")
             return False
+
+    def note_playback_position(self, position: float) -> None:
+        """Record where playback actually is, as reported by the player.
+
+        Pitch pre-rendering paces itself against this: it keeps each
+        windowed rendition a bounded distance ahead of the playhead rather
+        than racing every one of them to the end of the song.
+        """
+        self.now_playing_position = position
+        if self._using_rendition_manager:
+            self.rendition_manager.note_position(position)
 
     def can_fast_switch(self, semitones: int) -> bool:
         """Whether a pitch change can switch HLS audio renditions instead of restarting.

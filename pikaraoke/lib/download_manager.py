@@ -8,12 +8,11 @@ import uuid
 from queue import Queue
 from time import monotonic
 
-import psutil
 from gevent import Greenlet, spawn
 
 from pikaraoke.lib.events import EventSystem
-from pikaraoke.lib.get_platform import is_windows
 from pikaraoke.lib.preference_manager import PreferenceManager
+from pikaraoke.lib.process_priority import lower_priority
 from pikaraoke.lib.queue_manager import QueueManager
 from pikaraoke.lib.song_manager import SongManager
 from pikaraoke.lib.youtube_dl import (
@@ -90,24 +89,6 @@ def _summarise_ytdl_failure(output: str) -> str:
         if (stripped := line.strip()) and not stripped.startswith(_TEMPLATED_PREFIXES)
     ]
     return tail[-1] if tail else "Unknown error"
-
-
-def _use_spare_capacity(process: subprocess.Popen) -> None:
-    """Drop a download to background priority so it never competes with playback.
-
-    Priority is inherited, which is what covers the ffmpeg merge yt-dlp spawns.
-    """
-    try:
-        child = psutil.Process(process.pid)
-        if is_windows():
-            child.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
-            child.ionice(psutil.IOPRIO_VERYLOW)
-        else:
-            child.nice(10)
-            # macOS has no ionice at all, hence AttributeError below.
-            child.ionice(psutil.IOPRIO_CLASS_IDLE)
-    except (psutil.Error, AttributeError, NotImplementedError, OSError) as e:
-        logging.debug(f"Could not lower download priority: {e}")
 
 
 class DownloadManager:
@@ -343,7 +324,7 @@ class DownloadManager:
             bufsize=1,  # Line buffered
             universal_newlines=True,
         )
-        _use_spare_capacity(process)
+        lower_priority(process)
 
         output_buffer = []
         video_end = _FALLBACK_VIDEO_END if _selects_separate_streams(cmd) else 100.0

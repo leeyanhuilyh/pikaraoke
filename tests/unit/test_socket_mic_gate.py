@@ -131,4 +131,4 @@ def test_a_guest_splash_registers_and_reports_position():
     client.emit("playback_position", 12.5)
 
     assert any(m["name"] == "splash_role" for m in client.get_received())
-    assert karaoke.playback_controller.now_playing_position == 12.5
+    karaoke.playback_controller.note_playback_position.assert_called_once_with(12.5)

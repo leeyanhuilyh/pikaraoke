@@ -35,7 +35,7 @@ def make_request(
 @pytest.fixture(autouse=True)
 def no_reprioritize():
     """Keep psutil away from whatever pid a mocked Popen invents."""
-    with patch("pikaraoke.lib.download_manager._use_spare_capacity"):
+    with patch("pikaraoke.lib.download_manager.lower_priority"):
         yield
 
 

@@ -132,6 +132,9 @@ class MockPlaybackController:
     def prepare_pitch_switch(self, semitones: int) -> bool:
         return True
 
+    def note_playback_position(self, position: float) -> None:
+        self.now_playing_position = position
+
     def reset_now_playing(self) -> None:
         self.now_playing = None
         self.now_playing_filename = None
