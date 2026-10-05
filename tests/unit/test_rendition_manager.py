@@ -774,3 +774,54 @@ class TestRenditionManagerLaunchRace:
 
         assert result is None
         mock_cmd.assert_not_called()
+
+
+class TestTerminateAll:
+    """Tests for stopping a song's processes at song end."""
+
+    def test_signals_every_process_before_waiting_on_any(self):
+        """Terminating one at a time made teardown take seconds with a dozen
+        renditions; they now all stop in parallel."""
+        from pikaraoke.lib.rendition_manager import _terminate_all
+
+        calls = []
+        procs = []
+        for i in range(3):
+            proc = MagicMock()
+            proc.terminate.side_effect = lambda i=i: calls.append(f"terminate {i}")
+            proc.wait.side_effect = lambda timeout=None, i=i: calls.append(f"wait {i}")
+            procs.append(proc)
+
+        with patch("pikaraoke.lib.rendition_manager.resume_process"):
+            _terminate_all(procs)
+
+        assert calls[:3] == ["terminate 0", "terminate 1", "terminate 2"]
+        assert calls[3:] == ["wait 0", "wait 1", "wait 2"]
+
+    def test_kills_a_process_that_outlives_the_deadline(self):
+        import subprocess
+
+        from pikaraoke.lib.rendition_manager import _terminate_all
+
+        stubborn = MagicMock()
+        stubborn.wait.side_effect = [subprocess.TimeoutExpired("ffmpeg", 5), 0]
+
+        with patch("pikaraoke.lib.rendition_manager.resume_process"):
+            _terminate_all([stubborn])
+
+        stubborn.kill.assert_called_once()
+
+    def test_resumes_before_terminating(self):
+        """A suspended process ignores SIGTERM until it is resumed."""
+        from pikaraoke.lib.rendition_manager import _terminate_all
+
+        order = []
+        proc = MagicMock()
+        proc.terminate.side_effect = lambda: order.append("terminate")
+        with patch(
+            "pikaraoke.lib.rendition_manager.resume_process",
+            side_effect=lambda p: order.append("resume"),
+        ):
+            _terminate_all([proc])
+
+        assert order == ["resume", "terminate"]

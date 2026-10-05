@@ -105,25 +105,30 @@ def build_master_playlist(fr: "FileResolver", offsets: list[int], base_semitones
     return "\n".join(lines) + "\n"
 
 
-def _terminate(proc: subprocess.Popen | None, timeout: float = 5) -> None:
-    """Terminate a process gracefully, escalating to SIGKILL if it won't stop."""
-    if proc is None:
-        return
-    # A suspended process never gets round to handling SIGTERM, so it would
-    # sit out the timeout below before being killed. Renditions spend most
-    # of their life suspended and teardown terminates them one after
-    # another, so skipping this would add that timeout per rendition to the
-    # end of every song. Deliberately outside the try: if this were inside,
-    # a failure here would be swallowed and skip the terminate entirely.
-    resume_process(proc)
-    try:
-        proc.terminate()
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-    except Exception as e:
-        logging.debug(f"Process termination exception: {e}")
+def _terminate_all(processes: list[subprocess.Popen], timeout: float = 5) -> None:
+    """Terminate processes gracefully, escalating to SIGKILL for any still
+    running at a deadline they all share.
+
+    Signalled together rather than one terminate-and-wait at a time: a song
+    owns a dozen or more renditions, and waiting each one out in turn made
+    teardown take seconds that the next song then had to wait for.
+    """
+    for proc in processes:
+        # A suspended process never gets round to handling SIGTERM, so it
+        # would sit out the timeout below. Deliberately outside the try: if
+        # this were inside, a failure here would skip the terminate.
+        resume_process(proc)
+        try:
+            proc.terminate()
+        except OSError as e:
+            logging.debug(f"Process termination exception: {e}")
+    deadline = time.monotonic() + timeout
+    for proc in processes:
+        try:
+            proc.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def _count_segments(tmp_dir: str, marker: str) -> int:
@@ -632,8 +637,6 @@ class RenditionManager:
             self._fr = None
             video_process = self._video_process
             self._video_process = None
-        _terminate(video_process)
-        for proc in audio_processes:
-            _terminate(proc)
+        _terminate_all([p for p in (video_process, *audio_processes) if p is not None])
         if self._pace_thread and self._pace_thread.is_alive():
             self._pace_thread.join(timeout=1)

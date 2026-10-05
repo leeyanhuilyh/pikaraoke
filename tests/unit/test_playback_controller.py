@@ -427,6 +427,52 @@ class TestPlaybackControllerCanFastSwitch:
         assert pc.can_fast_switch(2) is True
 
 
+class TestPlaybackControllerTeardownRace:
+    """The temp directory is shared by every song. A finished song's
+    teardown deleted it while the next song was already writing into it,
+    failing that song's ffmpeg with "no such file"."""
+
+    @patch("pikaraoke.lib.playback_controller.time.sleep")
+    @patch("pikaraoke.lib.playback_controller.delete_tmp_dir")
+    def test_teardown_runs_while_holding_the_lock(self, mock_delete, mock_sleep, test_prefs):
+        pc = PlaybackController(test_prefs, EventSystem(), lambda x, remove_youtube_id=True: x)
+        pc.is_playing = True
+        held_during = {}
+        pc.stream_manager.kill_ffmpeg = MagicMock(
+            side_effect=lambda: held_during.setdefault("kill", pc._teardown_lock.locked())
+        )
+        mock_delete.side_effect = lambda: held_during.setdefault(
+            "delete", pc._teardown_lock.locked()
+        )
+
+        pc.end_song()
+
+        assert held_during == {"kill": True, "delete": True}
+        assert not pc._teardown_lock.locked()
+
+    def test_next_song_waits_for_the_previous_teardown(self, test_prefs, tmp_path):
+        import threading
+
+        song = tmp_path / "song.mp4"
+        song.write_text("x")
+        pc = PlaybackController(test_prefs, EventSystem(), lambda x, remove_youtube_id=True: x)
+        started = threading.Event()
+        pc.stream_manager.play_file = MagicMock(
+            side_effect=lambda *a: (started.set(), PlaybackResult(success=False, error="x"))[1]
+        )
+
+        pc._teardown_lock.acquire()  # a previous song still tearing down
+        worker = threading.Thread(target=pc.play_file, args=(str(song), "user"))
+        worker.start()
+        try:
+            assert not started.wait(0.2), "next song started during teardown"
+        finally:
+            pc._teardown_lock.release()
+        worker.join(timeout=2)
+
+        assert started.is_set()
+
+
 class TestPlaybackControllerNotePlaybackPosition:
     """Tests for the playhead feed that pitch pre-rendering paces against."""
 
