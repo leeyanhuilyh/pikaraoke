@@ -1,11 +1,13 @@
 """Unit tests for ffmpeg module."""
 
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from pikaraoke.lib.ffmpeg import (
     build_audio_only_ffmpeg_cmd,
+    build_ffmpeg_cmd,
     build_video_only_ffmpeg_cmd,
     get_ffmpeg_version,
     get_media_duration,
@@ -234,7 +236,9 @@ class TestBuildAudioOnlyFfmpegCmd:
         assert "-vcodec" not in args
         assert "-force_key_frames" not in args
 
-    def test_applies_rubberband_pitch_shift(self):
+    def test_shifts_pitch_by_resampling_not_rubberband(self):
+        """Renditions use the cheap resample-and-retime shifter; rubberband
+        costs about five times the CPU on a Pi and many are rendered."""
         args = build_audio_only_ffmpeg_cmd(
             _make_fr(),
             4,
@@ -244,12 +248,30 @@ class TestBuildAudioOnlyFfmpegCmd:
         ).get_args()
 
         filter_arg = args[args.index("-filter_complex") + 1]
-        assert "rubberband=pitch=1.259" in filter_arg
+        assert "rubberband" not in filter_arg
+        assert "asetrate=60476" in filter_arg
+        assert "atempo=0.7937" in filter_arg
 
-    def test_forces_fast_pitch_quality(self):
-        # Some ffmpeg/rubberband builds (e.g. what Raspberry Pi OS ships)
-        # may not default pitchq to speed - set it explicitly rather than
-        # assume, since a background/on-demand render's throughput matters.
+    def test_tempo_exactly_undoes_the_rate_change(self):
+        """Any mismatch between the two drifts the audio against the video
+        across a song, so the tempo is derived from the rounded rate."""
+        for semitones in range(-6, 7):
+            if semitones == 0:
+                continue
+            args = build_audio_only_ffmpeg_cmd(
+                _make_fr(),
+                semitones,
+                "/tmp/out.m3u8",
+                "/tmp/out_%03d.m4s",
+                "out_init.mp4",
+            ).get_args()
+            filter_arg = args[args.index("-filter_complex") + 1]
+            rate = int(re.search(r"asetrate=(\d+)", filter_arg).group(1))
+            tempo = float(re.search(r"atempo=([\d.]+)", filter_arg).group(1))
+
+            assert rate * tempo == pytest.approx(48000)
+
+    def test_encodes_16_bit_flac(self):
         args = build_audio_only_ffmpeg_cmd(
             _make_fr(),
             4,
@@ -258,19 +280,22 @@ class TestBuildAudioOnlyFfmpegCmd:
             "out_audio_p4_init.mp4",
         ).get_args()
 
-        filter_arg = args[args.index("-filter_complex") + 1]
-        assert "pitchq=speed" in filter_arg
+        assert args[args.index("-acodec") + 1] == "flac"
+        assert args[args.index("-sample_fmt") + 1] == "s16"
 
-    def test_zero_semitones_skips_rubberband(self):
-        args = build_audio_only_ffmpeg_cmd(
-            _make_fr(),
-            0,
-            "/tmp/out_audio_p0.m3u8",
-            "/tmp/out_audio_p0_%03d.m4s",
-            "out_audio_p0_init.mp4",
-        ).get_args()
+    def test_zero_semitones_applies_no_pitch_shift(self):
+        args = " ".join(
+            build_audio_only_ffmpeg_cmd(
+                _make_fr(),
+                0,
+                "/tmp/out_audio_p0.m3u8",
+                "/tmp/out_audio_p0_%03d.m4s",
+                "out_audio_p0_init.mp4",
+            ).get_args()
+        )
 
-        assert "rubberband" not in " ".join(args)
+        assert "rubberband" not in args
+        assert "asetrate" not in args
 
     def test_playlist_type_is_event_so_partial_renders_are_playable(self):
         # A vod playlist only lands when ffmpeg exits, which would make a
@@ -291,3 +316,23 @@ class TestBuildAudioOnlyFfmpegCmd:
 
         with pytest.raises(ValueError):
             build_audio_only_ffmpeg_cmd(fr, 0, "/tmp/out.m3u8", "/tmp/out_%03d.m4s", "out_init.mp4")
+
+
+class TestBuildFfmpegCmd:
+    """Tests for the single live stream, which keeps rubberband."""
+
+    @patch("pikaraoke.lib.ffmpeg.supports_hardware_h264_encoding", return_value=False)
+    def test_live_stream_shifts_pitch_with_fast_rubberband(self, mock_hw):
+        # Some ffmpeg/rubberband builds (e.g. what Raspberry Pi OS ships)
+        # may not default pitchq to speed - set it explicitly rather than
+        # assume.
+        fr = _make_fr()
+        fr.output_file = "/tmp/out.m3u8"
+        fr.segment_pattern = "/tmp/out_%03d.m4s"
+        fr.init_filename = "out_init.mp4"
+
+        args = " ".join(build_ffmpeg_cmd(fr, semitones=4).get_args())
+
+        assert "rubberband=pitch=1.259" in args
+        assert "pitchq=speed" in args
+        assert "asetrate" not in args

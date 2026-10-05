@@ -50,14 +50,45 @@ def _video_codec_and_bitrate(is_cdg: bool, file_extension: str) -> tuple[str, st
     return vcodec, vbitrate
 
 
-def _apply_audio_filters(audio, semitones: int, avsync: float, normalize_audio: bool):
-    """Apply avsync, pitch-shift, and loudness-normalization filters, in that order."""
+RENDITION_SAMPLE_RATE = 48000
+
+
+def _resample_pitch_shift(audio, semitones: int):
+    """Shift pitch by playing the audio at a different rate, then put the
+    duration back with atempo.
+
+    Measured on a Raspberry Pi 4 at roughly a fifth of rubberband's CPU,
+    and judged fine by ear even at +4 semitones. The tempo factor comes
+    from the rounded sample rate rather than the ideal ratio so the length
+    comes back where it started (within ~15ms over six minutes, measured):
+    any real mismatch would drift the audio against the video across a song.
+    """
+    rate = round(RENDITION_SAMPLE_RATE * 2 ** (semitones / 12))
+    return (
+        audio.filter("aresample", RENDITION_SAMPLE_RATE)
+        .filter("asetrate", rate)
+        .filter("aresample", RENDITION_SAMPLE_RATE)
+        .filter("atempo", RENDITION_SAMPLE_RATE / rate)
+    )
+
+
+def _apply_audio_filters(
+    audio, semitones: int, avsync: float, normalize_audio: bool, resample_pitch: bool = False
+):
+    """Apply avsync, pitch-shift, and loudness-normalization filters, in that order.
+
+    `resample_pitch` picks the cheap shifter used for pitch renditions, which
+    have to be rendered many at a time; the single live stream keeps
+    rubberband.
+    """
     if avsync > 0:
         audio = audio.filter("adelay", f"{avsync * 1000}|{avsync * 1000}")
     elif avsync < 0:
         audio = audio.filter("atrim", start=-avsync)
 
-    if semitones != 0:
+    if semitones != 0 and resample_pitch:
+        audio = _resample_pitch_shift(audio, semitones)
+    elif semitones != 0:
         # pitchq=speed is already librubberband's default on recent ffmpeg
         # builds, but older builds (e.g. what a Raspberry Pi OS repo ships)
         # may default elsewhere - set it explicitly rather than assume.
@@ -296,15 +327,21 @@ def build_audio_only_ffmpeg_cmd(
         raise ValueError("File path is required to build ffmpeg command")
 
     audio = _ffmpeg_input(fr.file_path, fr.file_extension or "").audio
-    audio = _apply_audio_filters(audio, semitones, avsync, normalize_audio)
+    audio = _apply_audio_filters(audio, semitones, avsync, normalize_audio, resample_pitch=True)
 
+    # FLAC rather than AAC: encoding is about a fifth of the CPU on a Pi 4,
+    # and a rendition is encoded once per pitch. The price is size, ~33MB
+    # per pitch for a five-minute song at 16-bit (32-bit, ffmpeg's default
+    # here, doubles that for nothing audible), which belongs on disk rather
+    # than a RAM-backed /tmp on a small Pi: point TMPDIR at a disk there.
     output = ffmpeg.output(
         audio,
         output_file,
-        acodec="aac",
-        audio_bitrate="192k",
+        acodec="flac",
+        compression_level=0,
+        sample_fmt="s16",
         ac=2,
-        ar=48000,
+        ar=RENDITION_SAMPLE_RATE,
         f="hls",
         hls_time=HLS_SEGMENT_SECONDS,
         hls_list_size=0,

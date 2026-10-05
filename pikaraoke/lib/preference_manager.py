@@ -43,15 +43,13 @@ class PreferenceManager:
         "avsync": 0,
         # Semitones on each side of the current key to pre-render in the
         # background for instant pitch switching. 0 disables pre-rendering.
-        # Measured on a Raspberry Pi 4, where a rendition renders about 6x
+        # Measured on a Raspberry Pi 4, where a rendition renders about 30x
         # faster than playback and one runs at a time: keeping N renditions
-        # abreast of the playhead needs N/6 of that throughput, so 1 (three
-        # renditions counting the base) sits near half and leaves room for
-        # a download or a library scan, 2 reaches ~80% and stops keeping up
-        # the moment anything else competes, and 3 cannot keep up at all.
-        # Pitches outside the window still work, they just render when
-        # asked for instead of being ready in advance.
-        "pitch_window_semitones": 1,
+        # abreast of the playhead needs N/30 of that throughput, so 6 (the
+        # whole supported range, thirteen renditions) sits under half,
+        # every key is pre-rendered within seconds of the song starting,
+        # and none is ever left to render on demand.
+        "pitch_window_semitones": 6,
         "browse_results_per_page": 100,
         "low_score_phrases": "",
         "mid_score_phrases": "",

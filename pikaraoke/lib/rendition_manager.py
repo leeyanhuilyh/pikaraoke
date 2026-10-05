@@ -100,7 +100,7 @@ def build_master_playlist(fr: "FileResolver", offsets: list[int], base_semitones
             f"DEFAULT={default},AUTOSELECT=YES,"
             f'URI="{fr.stream_uid}_audio_{semitone_label(s)}.m3u8"'
         )
-    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS="avc1.640028,mp4a.40.2",AUDIO="audio"')
+    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS="avc1.640028,fLaC",AUDIO="audio"')
     lines.append(f"{fr.stream_uid}_video.m3u8")
     return "\n".join(lines) + "\n"
 
