@@ -1,12 +1,11 @@
-"""Demucs-backed vocal separation with an on-disk cache.
+"""Vocal separation with an on-disk cache.
 
-Separation is the most expensive operation in the app - minutes of CPU for a
-single song - so the separated track is cached and reused for every later play
-of that song, and demucs never runs twice on the same source.
+Separation is the most expensive operation in the app - a minute or more of CPU
+for a single song - so the separated track is cached and reused for every later
+play of that song, and a song is never separated twice.
 
 Only the vocals-removed track is kept. The original file already is the
-"vocals on" side of the toggle, so the isolated vocal stem demucs also produces
-has no playback use and is discarded.
+"vocals on" side of the toggle.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from queue import Queue
 from gevent import Greenlet, spawn
 
 from pikaraoke.lib.events import EventSystem
-from pikaraoke.lib.get_platform import use_spare_capacity
+from pikaraoke.lib.get_platform import get_data_directory, use_spare_capacity
 from pikaraoke.lib.metadata_parser import extract_youtube_id
 from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.song_list import STEMS_DIR_NAME
@@ -36,15 +35,7 @@ BACKGROUND = "background"
 BEFORE_PLAY = "before_play"
 MODES = (OFF, BACKGROUND, BEFORE_PLAY)
 
-# Let demucs pick the device itself, rather than pinning one.
-DEVICE_AUTO = "auto"
-
-# Hybrid Transformer Demucs: the fork's default model, and the best quality of
-# the bundled models for the 2-stem split we need.
-MODEL = "htdemucs"
-
-# The separated track is only ever a backing track behind a live singer, so it
-# does not need the 320k the demucs CLI defaults to.
+# The separated track is only ever a backing track behind a live singer.
 MP3_BITRATE = "192k"
 
 _NO_VOCALS_SUFFIX = ".no_vocals.mp3"
@@ -120,14 +111,6 @@ class VocalSeparator:
         mode = self._preferences.get_or_default("vocal_separation")
         return mode if mode in MODES else OFF
 
-    def is_available(self) -> bool:
-        """Whether the vendored demucs submodule is present to run at all.
-
-        Only reports that the code is there. Its heavy dependencies (torch)
-        are installed separately, and a missing one surfaces as a failed run.
-        """
-        return _vendored_demucs_dir() is not None
-
     def cached_track(self, song_path: str) -> str | None:
         """Path to this song's cached vocals-removed track, if one is current.
 
@@ -176,7 +159,7 @@ class VocalSeparator:
 
         Separations run one at a time. A caller arriving while the same song is
         already being separated waits for it and gets its cached result rather
-        than running demucs a second time.
+        than separating it a second time.
 
         Returns:
             Path to the cached vocals-removed track, or None if separation
@@ -189,77 +172,22 @@ class VocalSeparator:
             return self._separate_uncached(song_path)
 
     def _separate_uncached(self, song_path: str) -> str | None:
-        """Run demucs for a song known not to be cached. Caller holds the lock."""
-        demucs_dir = _vendored_demucs_dir()
-        if demucs_dir is None:
-            logging.error(
-                "Vocal separation is enabled but the demucs submodule is missing. "
-                "Run: git submodule update --init"
-            )
-            return None
-
-        # Recorded before separation: a song replaced while demucs was running
+        """Separate a song known not to be cached. Caller holds the lock."""
+        # Recorded before separation: a song replaced while it was separating
         # would otherwise be fingerprinted as the source of a track made from
         # the file it replaced.
         fingerprint = _fingerprint(song_path)
         if fingerprint is None:
             return None
 
-        with tempfile.TemporaryDirectory(prefix="pikaraoke-demucs-") as work_dir:
-            if not self._run_demucs(song_path, work_dir, demucs_dir):
-                return None
-            produced = _find_no_vocals(work_dir)
-            if produced is None:
-                logging.error(f"Demucs produced no vocals-removed track for {song_path}")
+        with tempfile.TemporaryDirectory(prefix="pikaraoke-separation-") as work_dir:
+            pcm = os.path.join(work_dir, "no_vocals.pcm")
+            if not _run_mdx(song_path, pcm):
                 return None
             encoded = os.path.join(work_dir, "no_vocals.mp3")
-            if not _encode_mp3(produced, encoded):
+            if not _encode_mp3(pcm, encoded):
                 return None
             return self._store(song_path, encoded, fingerprint)
-
-    def _run_demucs(self, song_path: str, out_dir: str, demucs_dir: str) -> bool:
-        """Run the demucs CLI over one song. Returns True on a clean exit."""
-        cmd = [
-            sys.executable,
-            "-m",
-            "demucs.separate",
-            "--two-stems",
-            "vocals",
-            "-n",
-            MODEL,
-            "-o",
-            out_dir,
-        ]
-        device = self._preferences.get_or_default("vocal_separation_device")
-        if device and device != DEVICE_AUTO:
-            cmd += ["-d", device]
-        cmd.append(song_path)
-        # The vendored fork is run in place rather than installed, so its own
-        # directory goes on the path ahead of any demucs in site-packages.
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(
-            [demucs_dir, env["PYTHONPATH"]] if env.get("PYTHONPATH") else [demucs_dir]
-        )
-
-        logging.info(f"Separating vocals: {song_path}")
-        try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env,
-            )
-        except OSError as e:
-            logging.error(f"Could not start demucs: {e}")
-            return False
-
-        use_spare_capacity(process)
-        output, _unused = process.communicate()
-        if process.returncode != 0:
-            logging.error(f"Demucs failed for {song_path} (exit {process.returncode}): {output}")
-            return False
-        return True
 
     def _store(self, song_path: str, produced: str, fingerprint: dict) -> str | None:
         """Move a finished track into the cache and record what it was made from."""
@@ -296,25 +224,38 @@ class VocalSeparator:
                 self._queue.task_done()
 
 
-def _vendored_demucs_dir() -> str | None:
-    """Directory of the vendored demucs fork, or None when it is not checked out."""
-    # This file is <repo>/pikaraoke/lib/vocal_separator.py
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    path = os.path.join(repo_root, "vendor", "demucs")
-    return path if os.path.isdir(os.path.join(path, "demucs")) else None
-
-
-def _encode_mp3(wav_path: str, mp3_path: str) -> bool:
-    """Encode demucs' lossless output to mp3 with ffmpeg, not demucs' own encoder.
-
-    Demucs' built-in mp3 encoder writes no gapless header, so the encoder's
-    1105-sample delay is never trimmed and the track plays about 25ms late
-    against the original. ffmpeg records the delay in the file, and trims it
-    again when it decodes, so the length and alignment match the source.
-    """
-    cmd = ["ffmpeg", "-v", "error", "-y", "-i", wav_path, "-c:a", "libmp3lame", "-b:a", MP3_BITRATE]
+def _run_mdx(song_path: str, pcm_path: str) -> bool:
+    """Run the MDX separator over one song in its own process. True on a clean exit."""
+    cmd = [sys.executable, "-m", "pikaraoke.lib.mdx", song_path, pcm_path]
+    cmd += ["--model-dir", os.path.join(get_data_directory(), "models")]
+    logging.info(f"Separating vocals: {song_path}")
     try:
-        result = subprocess.run(cmd + [mp3_path], capture_output=True, text=True, check=False)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except OSError as e:
+        logging.error(f"Could not start the vocal separator: {e}")
+        return False
+
+    use_spare_capacity(process)
+    output, _unused = process.communicate()
+    if process.returncode != 0:
+        logging.error(
+            f"Vocal separation failed for {song_path} (exit {process.returncode}): {output}"
+        )
+        return False
+    return True
+
+
+def _encode_mp3(pcm_path: str, mp3_path: str) -> bool:
+    """Encode the separator's raw PCM to mp3 with ffmpeg.
+
+    ffmpeg records the mp3 encoder's 1105-sample delay in the file and trims it
+    again when decoding, so the track stays sample-aligned with the original.
+    An encoder that skips that header leaves the track about 25ms late.
+    """
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", "44100", "-ac", "2"]
+    cmd += ["-i", pcm_path, "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, mp3_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except OSError as e:
         logging.error(f"Could not start ffmpeg to encode the separated track: {e}")
         return False
@@ -322,12 +263,3 @@ def _encode_mp3(wav_path: str, mp3_path: str) -> bool:
         logging.error(f"ffmpeg failed encoding the separated track: {result.stderr}")
         return False
     return True
-
-
-def _find_no_vocals(work_dir: str) -> str | None:
-    """Locate the no_vocals file demucs wrote under its model-named subfolder."""
-    for dirpath, _dirnames, filenames in os.walk(work_dir):
-        for filename in filenames:
-            if filename.startswith("no_vocals."):
-                return os.path.join(dirpath, filename)
-    return None

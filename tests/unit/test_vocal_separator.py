@@ -136,50 +136,47 @@ class TestQueueSeparation:
 
 
 class TestSeparate:
-    def test_returns_the_cached_track_without_running_demucs(self, separator, songs_dir):
+    @staticmethod
+    def fake_separator(pcm: bytes = b"raw-backing-track", returncode: int = 0):
+        """A Popen stand-in that writes `pcm` where the separator writes its output."""
+        calls = []
+
+        def popen(cmd, **kwargs):
+            calls.append(cmd)
+            if returncode == 0:
+                with open(cmd[4], "wb") as f:
+                    f.write(pcm)
+            process = MagicMock()
+            process.communicate.return_value = ("" if returncode == 0 else "boom", None)
+            process.returncode = returncode
+            return process
+
+        return popen, calls
+
+    def test_returns_the_cached_track_without_running_the_separator(self, separator, songs_dir):
         song = make_song(songs_dir)
         track = write_cache(separator, song)
         with patch("pikaraoke.lib.vocal_separator.subprocess.Popen") as popen:
             assert separator.separate(song) == track
         popen.assert_not_called()
 
-    def test_gives_up_when_the_submodule_is_missing(self, separator, songs_dir):
-        song = make_song(songs_dir)
-        with patch("pikaraoke.lib.vocal_separator._vendored_demucs_dir", return_value=None):
-            with patch("pikaraoke.lib.vocal_separator.subprocess.Popen") as popen:
-                assert separator.separate(song) is None
-        popen.assert_not_called()
-
-    def test_caches_what_demucs_produced(self, separator, songs_dir, events):
+    def test_caches_what_the_separator_produced(self, separator, songs_dir, events):
         song = make_song(songs_dir)
         separated = []
         events.on("vocals_separated", lambda path, track: separated.append((path, track)))
+        popen, _calls = self.fake_separator()
 
-        def fake_demucs(cmd, **kwargs):
-            # Write into the -o directory the way the demucs CLI does, under a
-            # subfolder named for the model.
-            out_dir = cmd[cmd.index("-o") + 1]
-            track_dir = os.path.join(out_dir, "htdemucs", "song")
-            os.makedirs(track_dir)
-            with open(os.path.join(track_dir, "no_vocals.wav"), "wb") as f:
-                f.write(b"lossless-backing-track")
-            process = MagicMock()
-            process.communicate.return_value = ("", None)
-            process.returncode = 0
-            return process
-
-        def fake_encode(wav_path, mp3_path):
-            with open(wav_path, "rb") as f:
-                assert f.read() == b"lossless-backing-track"
+        def fake_encode(pcm_path, mp3_path):
+            with open(pcm_path, "rb") as f:
+                assert f.read() == b"raw-backing-track"
             with open(mp3_path, "wb") as f:
                 f.write(b"backing-track")
             return True
 
-        with patch("pikaraoke.lib.vocal_separator._vendored_demucs_dir", return_value="/demucs"):
-            with patch("pikaraoke.lib.vocal_separator.subprocess.Popen", side_effect=fake_demucs):
-                with patch("pikaraoke.lib.vocal_separator.use_spare_capacity"):
-                    with patch("pikaraoke.lib.vocal_separator._encode_mp3", fake_encode):
-                        track = separator.separate(song)
+        with patch("pikaraoke.lib.vocal_separator.subprocess.Popen", side_effect=popen):
+            with patch("pikaraoke.lib.vocal_separator.use_spare_capacity"):
+                with patch("pikaraoke.lib.vocal_separator._encode_mp3", fake_encode):
+                    track = separator.separate(song)
 
         assert track is not None
         with open(track, "rb") as f:
@@ -188,44 +185,32 @@ class TestSeparate:
         assert separator.cached_track(song) == track
         assert separated == [(song, track)]
 
-    def test_nothing_is_cached_when_demucs_fails(self, separator, songs_dir):
+    def test_nothing_is_cached_when_separation_fails(self, separator, songs_dir):
         song = make_song(songs_dir)
-        process = MagicMock()
-        process.communicate.return_value = ("boom", None)
-        process.returncode = 1
+        popen, _calls = self.fake_separator(returncode=1)
 
-        with patch("pikaraoke.lib.vocal_separator._vendored_demucs_dir", return_value="/demucs"):
-            with patch("pikaraoke.lib.vocal_separator.subprocess.Popen", return_value=process):
-                with patch("pikaraoke.lib.vocal_separator.use_spare_capacity"):
-                    assert separator.separate(song) is None
+        with patch("pikaraoke.lib.vocal_separator.subprocess.Popen", side_effect=popen):
+            with patch("pikaraoke.lib.vocal_separator.use_spare_capacity"):
+                assert separator.separate(song) is None
 
         assert separator.cached_track(song) is None
 
-    def test_runs_the_vendored_fork_not_an_installed_demucs(self, separator, songs_dir):
-        """The fork is the point of vendoring it, so it must win the import."""
+    def test_runs_the_separator_in_its_own_process(self, separator, songs_dir):
+        """In-process, its number crunching would stall the web server between chunks."""
         song = make_song(songs_dir)
-        process = MagicMock()
-        process.communicate.return_value = ("", None)
-        process.returncode = 1
-        captured = {}
+        popen, calls = self.fake_separator(returncode=1)
 
-        def capture(cmd, **kwargs):
-            captured["cmd"] = cmd
-            captured["env"] = kwargs["env"]
-            return process
-
-        with patch(
-            "pikaraoke.lib.vocal_separator._vendored_demucs_dir", return_value="/vendor/demucs"
-        ):
-            with patch("pikaraoke.lib.vocal_separator.subprocess.Popen", side_effect=capture):
-                with patch("pikaraoke.lib.vocal_separator.use_spare_capacity"):
+        with patch("pikaraoke.lib.vocal_separator.subprocess.Popen", side_effect=popen):
+            with patch("pikaraoke.lib.vocal_separator.use_spare_capacity") as lowered:
+                with patch(
+                    "pikaraoke.lib.vocal_separator.get_data_directory", return_value="/data"
+                ):
                     separator.separate(song)
 
-        assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == "/vendor/demucs"
-        assert "--two-stems" in captured["cmd"]
-        assert captured["cmd"][captured["cmd"].index("--two-stems") + 1] == "vocals"
-        # The mp3 is made by ffmpeg afterwards, so demucs must not make its own.
-        assert "--mp3" not in captured["cmd"]
+        cmd = calls[0]
+        assert cmd[1:4] == ["-m", "pikaraoke.lib.mdx", song]
+        assert cmd[cmd.index("--model-dir") + 1] == os.path.join("/data", "models")
+        lowered.assert_called_once()
 
 
 class TestConcurrentSeparation:
@@ -250,27 +235,23 @@ class TestConcurrentSeparation:
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs a real ffmpeg")
 class TestEncodeMp3:
     def test_encoded_track_decodes_to_the_same_length_as_the_source(self, tmp_path):
-        """Demucs' own mp3 encoder left the track 1105 samples (25ms) long and late,
-        which is an audible jump when toggling vocals against the original audio."""
-        wav = str(tmp_path / "in.wav")
+        """An mp3 encoder that doesn't record its 1105-sample delay leaves the track
+        25ms late, which is an audible jump when toggling vocals against the original."""
+        pcm = str(tmp_path / "in.pcm")
         mp3 = str(tmp_path / "out.mp3")
         subprocess.run(
-            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=d=3:r=44100", "-ac", "2", wav],
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=d=3:r=44100"]
+            + ["-ac", "2", "-f", "s16le", pcm],
             check=True,
         )
-        assert _encode_mp3(wav, mp3)
+        assert _encode_mp3(pcm, mp3)
 
-        def sample_count(path):
-            raw = subprocess.run(
-                ["ffmpeg", "-v", "error", "-i", path, "-f", "s16le", "-ac", "2", "-"],
-                capture_output=True,
-                check=True,
-            ).stdout
-            return len(raw) // 4
+        decoded = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", mp3, "-f", "s16le", "-ac", "2", "-"],
+            capture_output=True,
+            check=True,
+        ).stdout
+        assert abs(len(decoded) // 4 - os.path.getsize(pcm) // 4) < 10
 
-        assert abs(sample_count(mp3) - sample_count(wav)) < 10
-
-    def test_reports_failure_for_an_unreadable_input(self, tmp_path):
-        bad = tmp_path / "bad.wav"
-        bad.write_bytes(b"not audio")
-        assert not _encode_mp3(str(bad), str(tmp_path / "out.mp3"))
+    def test_reports_failure_for_a_missing_input(self, tmp_path):
+        assert not _encode_mp3(str(tmp_path / "missing.pcm"), str(tmp_path / "out.mp3"))

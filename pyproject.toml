@@ -27,34 +27,12 @@ dependencies = [
   "sounddevice>=0.5.0; sys_platform != 'linux'",
 ]
 
-# The vendored fork, not PyPI's demucs.
-[tool.uv.sources]
-demucs = { path = "vendor/demucs", editable = true }
-# PyPI's ARM Linux torch is a CUDA build for NVIDIA's ARM servers, and pulls
-# several GB of NVIDIA libraries a Raspberry Pi can never use. The CPU-only
-# build from PyTorch's own index has none. Everywhere else keeps PyPI's torch:
-# the CUDA build on x86_64 Linux and Windows, MPS on Apple Silicon.
-torch = [
-  { index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-# Only torch is taken from here; every other package still comes from PyPI.
-explicit = true
-
 [tool.uv]
 # A default group rather than a project dependency: `uv run` installs it, so
-# vocal separation works out of the box, but torch stays out of the Docker
-# image, the Windows installer and a plain `pip install pikaraoke`, none of
-# which ship the vendor/ submodule it is built from.
+# vocal separation works out of the box, but it stays out of the Docker image
+# (Alpine, which onnxruntime publishes nothing for), the Windows installer and
+# a plain `pip install pikaraoke`.
 default-groups = ["dev", "vocal-separation"]
-# Intel macOS is left out of the resolution deliberately. torch published no
-# wheels for it after 2.2, so demucs pins torch<2.3 there, and a universal
-# resolution would hold every other platform back to a torch too old to have
-# wheels for the Python this project runs on.
-environments = ["sys_platform != 'darwin' or platform_machine != 'x86_64'"]
 
 [project.optional-dependencies]
 dev = [
@@ -71,10 +49,11 @@ dev = [
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
 ]
+# Only where onnxruntime publishes current packages: none for Python 3.10,
+# Intel Macs or 32-bit ARM since 1.23. Elsewhere vocal separation is unavailable.
 vocal-separation = [
-    "demucs",
-    # Listed directly, though demucs already requires it, so the source above applies.
-    "torch",
+    "numpy; python_version >= '3.11' and platform_machine != 'armv7l' and (sys_platform != 'darwin' or platform_machine == 'arm64')",
+    "onnxruntime; python_version >= '3.11' and platform_machine != 'armv7l' and (sys_platform != 'darwin' or platform_machine == 'arm64')",
 ]
 translations = [
     "deep-translator>=1.11.4",
