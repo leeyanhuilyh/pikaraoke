@@ -15,7 +15,7 @@ from pikaraoke.lib.get_platform import use_spare_capacity
 from pikaraoke.lib.preference_manager import PreferenceManager
 from pikaraoke.lib.queue_manager import QueueManager
 from pikaraoke.lib.song_manager import SongManager
-from pikaraoke.lib.vocal_separator import BACKGROUND, BEFORE_PLAY, VocalSeparator
+from pikaraoke.lib.vocal_separator import OFF, VocalSeparator
 from pikaraoke.lib.youtube_dl import (
     POSTPROCESS_PREFIX,
     PROGRESS_PREFIX,
@@ -421,24 +421,13 @@ class DownloadManager:
         return True
 
     def _separate_vocals(self, song_path: str) -> None:
-        """Separate a finished download's vocals, per the vocal_separation mode.
+        """Start separating a finished download's vocals in the background.
 
-        In before_play mode this blocks the download worker, which is the point:
-        the song must not reach the playback queue until its vocals-off track
-        exists, or the toggle would be dead for the opening of the song.
+        Never blocks the download: in before_play mode, playback waits for a
+        head start when the song comes up instead (see Karaoke.prepare_vocals).
         """
-        if self._vocal_separator is None:
-            return
-        mode = self._vocal_separator.mode
-        if mode == BACKGROUND:
+        if self._vocal_separator is not None and self._vocal_separator.mode != OFF:
             self._vocal_separator.queue_separation(song_path)
-        elif mode == BEFORE_PLAY:
-            # The queue page polls while a download is active, so setting the
-            # status is enough to show the phase; it is still the active
-            # download until _process_queue's finally clears it.
-            if self.active_download:
-                self.active_download["status"] = "separating"
-            self._vocal_separator.separate(song_path)
 
     def _execute_download(self, request: dict) -> int:
         """Execute a video download, re-queueing it if it fails with attempts to spare.

@@ -25,11 +25,13 @@ def test_prefs():
     return PreferenceManager("/nonexistent/test_config.ini")
 
 
-def _separator(mode="background", track="/songs/.stems/x.no_vocals.mp3"):
-    """A vocal separator stand-in in a given mode, with or without a finished track."""
+def _separator(mode="background", track="/songs/.stems/x.no_vocals.mp3", partial=None):
+    """A vocal separator stand-in in a given mode, with a finished track, a partial
+    one still being written, or neither."""
     sep = MagicMock()
     sep.mode = mode
     sep.cached_track.return_value = track
+    sep.partial_track.return_value = partial
     return sep
 
 
@@ -559,3 +561,125 @@ class TestVocalsOffRenditions:
 
         assert rm._source_path is None
         assert rm.no_vocals_available() is False
+
+
+class FakeStdin:
+    """A rendition's stdin: collects what is written, and can play dead like a killed ffmpeg."""
+
+    def __init__(self, broken=False):
+        self.written = bytearray()
+        self.closed = False
+        self.broken = broken
+
+    def write(self, data):
+        if self.broken:
+            raise BrokenPipeError
+        self.written += data
+
+    def close(self):
+        self.closed = True
+
+
+class TestFollowingAPartialTrack:
+    """A vocals-off rendition started while its song is still being separated."""
+
+    @staticmethod
+    def _manager(test_prefs, separator):
+        rm = RenditionManager(test_prefs, vocal_separator=separator)
+        rm._source_path = "/songs/Song---abc12345678.mp4"
+        return rm
+
+    def test_a_partial_track_counts_as_available(self, test_prefs):
+        rm = self._manager(test_prefs, _separator(track=None, partial="/stems/x.partial.pcm"))
+        assert rm.no_vocals_available() is True
+
+    def test_renders_from_stdin_and_feeds_it_the_partial_track(self, test_prefs, tmp_path):
+        partial = tmp_path / "x.partial.pcm"
+        partial.write_bytes(b"pcm")
+        rm = self._manager(test_prefs, _separator(track=None, partial=str(partial)))
+        rm._fr = _make_mock_fr(tmp_dir=str(tmp_path))
+
+        with patch("pikaraoke.lib.rendition_manager.build_audio_only_ffmpeg_cmd") as build:
+            with patch("pikaraoke.lib.rendition_manager.Thread") as thread:
+                rm._launch_render(rm._fr, Rendition(0, False))
+
+        assert build.call_args.kwargs["audio_from_stdin"] is True
+        assert build.call_args.args[-1] is None
+        assert thread.call_args.kwargs["target"] == rm._follow
+
+    def test_feeds_everything_and_closes_once_separation_finishes(self, test_prefs, tmp_path):
+        partial = tmp_path / "x.partial.pcm"
+        partial.write_bytes(b"first part")
+        separator = _separator(track=None, partial=str(partial))
+        rm = self._manager(test_prefs, separator)
+        stdin = FakeStdin()
+        writes = iter([b" second part", b" last part"])
+
+        def keep_writing(_seconds):
+            # The separator appends between polls, then finishes after the last part.
+            with open(partial, "ab") as f:
+                chunk = next(writes, None)
+                if chunk is None:
+                    separator.partial_track.return_value = None
+                    return
+                f.write(chunk)
+
+        with patch("pikaraoke.lib.rendition_manager.time.sleep", side_effect=keep_writing):
+            rm._follow(open(partial, "rb"), str(partial), MagicMock(stdin=stdin))
+
+        assert bytes(stdin.written) == b"first part second part last part"
+        assert stdin.closed
+
+    def test_picks_up_what_was_written_just_before_separation_finished(self, test_prefs, tmp_path):
+        """The last chunk can land between the follower's read and its check that
+        separation is done; it must still be delivered."""
+        partial = tmp_path / "x.partial.pcm"
+        partial.write_bytes(b"")
+        separator = _separator(track=None, partial=str(partial))
+        rm = self._manager(test_prefs, separator)
+        stdin = FakeStdin()
+
+        def finish_right_after_the_read(_song):
+            with open(partial, "ab") as f:
+                f.write(b"final chunk")
+            return None
+
+        separator.partial_track.side_effect = finish_right_after_the_read
+        rm._follow(open(partial, "rb"), str(partial), MagicMock(stdin=stdin))
+
+        assert bytes(stdin.written) == b"final chunk"
+
+    def test_stops_quietly_when_the_rendition_was_killed(self, test_prefs, tmp_path):
+        partial = tmp_path / "x.partial.pcm"
+        partial.write_bytes(b"data")
+        rm = self._manager(test_prefs, _separator(track=None, partial=str(partial)))
+        stdin = FakeStdin(broken=True)
+
+        rm._follow(open(partial, "rb"), str(partial), MagicMock(stdin=stdin))
+
+        assert stdin.closed
+
+    def test_stops_when_the_song_ends(self, test_prefs, tmp_path):
+        partial = tmp_path / "x.partial.pcm"
+        partial.write_bytes(b"")
+        rm = self._manager(test_prefs, _separator(track=None, partial=str(partial)))
+        rm._stop_event.set()
+        stdin = FakeStdin()
+
+        rm._follow(open(partial, "rb"), str(partial), MagicMock(stdin=stdin))
+
+        assert stdin.closed
+
+    def test_uses_the_cached_track_if_the_partial_one_was_just_cleaned_up(
+        self, test_prefs, tmp_path
+    ):
+        """Separation can finish, and its partial track be deleted, between the lookup
+        and opening it: the finished track is there by then."""
+        separator = _separator(track=None, partial=str(tmp_path / "gone.partial.pcm"))
+        rm = self._manager(test_prefs, separator)
+
+        with patch(
+            "pikaraoke.lib.rendition_manager.open", side_effect=FileNotFoundError, create=True
+        ):
+            separator.cached_track.side_effect = [None, "/stems/x.no_vocals.mp3"]
+            assert rm._open_no_vocals() == ("/stems/x.no_vocals.mp3", None)

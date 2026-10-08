@@ -297,6 +297,7 @@ class Karaoke:
         # A song separated in the background may already be playing, and this
         # is what turns its vocals button on.
         self.events.on("vocals_separated", lambda *_: self.update_now_playing_socket())
+        self.events.on("vocals_separating", lambda *_: self.update_now_playing_socket())
         self._relay_to_browser("sync_started")
         self._relay_to_browser("sync_finished")
 
@@ -608,12 +609,14 @@ class Karaoke:
             True if the switch was made, False if this song can't switch (yet).
         """
         pc = self.playback_controller
-        if not pc.can_switch_vocals(vocals_on):
+        # The second check refuses too: while the vocals-off track is still
+        # catching up with the playhead, switching to it would stall the player.
+        if not pc.can_switch_vocals(vocals_on) or not pc.prepare_switch(
+            pc.now_playing_transpose, vocals_on
+        ):
             # MSG: Message shown when the vocals button is used before the song's vocals have been separated
             self.log_and_send(_("Vocals can't be switched for this song yet"), "danger")
             return False
-        if not pc.prepare_switch(pc.now_playing_transpose, vocals_on):
-            logging.debug("Vocals rendition not fully buffered yet, switching anyway")
         pc.now_playing_vocals = vocals_on
         if vocals_on:
             # MSG: Message shown after the song's vocals are switched back on
@@ -739,16 +742,24 @@ class Karaoke:
         if self.vocal_separator.mode != OFF:
             self.vocal_separator.queue_separation(song_path)
 
-    def separate_before_play(self, song_path: str) -> None:
-        """In before_play mode, hold playback until the song's vocals-off track exists."""
-        if self.vocal_separator.mode != BEFORE_PLAY:
+    def prepare_vocals(self, song_path: str) -> None:
+        """Get a song's vocal separation going ahead of everything else, as it's about to play.
+
+        In before_play mode, also hold playback until separation has a head
+        start, so vocals can be switched off from the first bar. That takes
+        seconds, not the whole song: separation runs faster than playback, so
+        from there the vocals-off track stays ahead on its own.
+        """
+        separator = self.vocal_separator
+        if separator.mode == OFF or separator.cached_track(song_path):
             return
-        if self.vocal_separator.cached_track(song_path):
+        separator.prioritize(song_path)
+        if separator.mode != BEFORE_PLAY:
             return
         self.separating_title = self.song_manager.display_name_from_path(song_path)
         self.update_now_playing_socket()
         try:
-            self.vocal_separator.separate(song_path)
+            separator.wait_for_head_start(song_path)
         finally:
             self.separating_title = None
             self.update_now_playing_socket()
@@ -802,7 +813,7 @@ class Karaoke:
                             self.playback_controller.claim(song["file"])
                     if not song:
                         continue
-                    self.separate_before_play(song["file"])
+                    self.prepare_vocals(song["file"])
                     result = self.playback_controller.play_file(
                         song["file"], song["user"], song["semitones"]
                     )

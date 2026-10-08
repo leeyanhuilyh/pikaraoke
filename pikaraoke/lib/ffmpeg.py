@@ -17,6 +17,13 @@ if TYPE_CHECKING:
 
 HLS_SEGMENT_SECONDS = 3
 
+# Raw PCM the vocal separator writes and audio renditions can read while it is
+# still being written: 16-bit little-endian stereo at 44.1kHz, no header.
+PCM_FORMAT = "s16le"
+PCM_SAMPLE_RATE = 44100
+PCM_CHANNELS = 2
+PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_CHANNELS * 2
+
 
 def _ffmpeg_input(file_path: str, file_extension: str):
     """Build an ffmpeg input, adding genpts for containers with VFR/timestamp issues."""
@@ -264,6 +271,7 @@ def build_audio_only_ffmpeg_cmd(
     normalize_audio: bool = True,
     avsync: float = 0,
     audio_source: str | None = None,
+    audio_from_stdin: bool = False,
 ) -> Any:
     """Build an ffmpeg command for an audio-only HLS rendition at a given pitch.
 
@@ -288,6 +296,8 @@ def build_audio_only_ffmpeg_cmd(
         audio_source: Audio file to render instead of the song's own audio,
             e.g. its vocals-removed track. It must line up sample for sample
             with the song, since it is switched to mid-playback.
+        audio_from_stdin: Read the audio as raw PCM (see PCM_FORMAT) from
+            stdin instead, for a source that is still being written.
 
     Returns:
         ffmpeg stream object ready to execute with run_async().
@@ -297,11 +307,12 @@ def build_audio_only_ffmpeg_cmd(
     if fr.file_path is None:
         raise ValueError("File path is required to build ffmpeg command")
 
-    if audio_source:
-        source, extension = audio_source, os.path.splitext(audio_source)[1].lower()
+    if audio_from_stdin:
+        audio = ffmpeg.input("pipe:", f=PCM_FORMAT, ar=PCM_SAMPLE_RATE, ac=PCM_CHANNELS).audio
+    elif audio_source:
+        audio = _ffmpeg_input(audio_source, os.path.splitext(audio_source)[1].lower()).audio
     else:
-        source, extension = fr.file_path, fr.file_extension or ""
-    audio = _ffmpeg_input(source, extension).audio
+        audio = _ffmpeg_input(fr.file_path, fr.file_extension or "").audio
     audio = _apply_audio_filters(audio, semitones, avsync, normalize_audio)
 
     output = ffmpeg.output(
@@ -319,6 +330,10 @@ def build_audio_only_ffmpeg_cmd(
         hls_fmp4_init_filename=init_filename,
         hls_segment_filename=segment_filename,
     )
+    # Nothing reads this process's output, and a rendition following a track
+    # that is still being separated can run for minutes: ffmpeg's progress
+    # line would fill the pipe and freeze it.
+    output = output.global_args("-nostats", "-loglevel", "error")
 
     args = output.get_args()
     logging.debug(f"COMMAND: ffmpeg " + " ".join(args))

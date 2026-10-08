@@ -4,7 +4,9 @@ Separation is the most expensive operation in the app - a minute or more of CPU
 for a single song - so the separated track is cached and reused for every later
 play of that song, and a song is never separated twice.
 
-Only the vocals-removed track is kept. The original file already is the
+The track is written as it is produced, so a song can start playing, and its
+vocals-off track can follow along just behind, long before the whole song is
+done. Only the vocals-removed track is kept: the original file already is the
 "vocals on" side of the toggle.
 """
 
@@ -18,12 +20,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
-from queue import Queue
+import time
 
-from gevent import Greenlet, spawn
+from gevent import Greenlet, sleep, spawn
+from gevent.event import Event
 
 from pikaraoke.lib.events import EventSystem
+from pikaraoke.lib.ffmpeg import (
+    PCM_BYTES_PER_SECOND,
+    PCM_CHANNELS,
+    PCM_FORMAT,
+    PCM_SAMPLE_RATE,
+)
 from pikaraoke.lib.get_platform import get_data_directory, use_spare_capacity
 from pikaraoke.lib.metadata_parser import extract_youtube_id
 from pikaraoke.lib.preference_manager import PreferenceManager
@@ -38,8 +46,15 @@ MODES = (OFF, BACKGROUND, BEFORE_PLAY)
 # The separated track is only ever a backing track behind a live singer.
 MP3_BITRATE = "192k"
 
+# How much vocals-removed audio a song needs before it starts, in before_play
+# mode. Separation then runs faster than playback, so it stays ahead from here.
+PLAYBACK_HEAD_START_SECONDS = 15
+HEAD_START_TIMEOUT_SECONDS = 180
+
 _NO_VOCALS_SUFFIX = ".no_vocals.mp3"
 _FINGERPRINT_SUFFIX = ".json"
+# Raw PCM written while a separation runs, encoded to the mp3 once it finishes.
+_PARTIAL_SUFFIX = ".partial.pcm"
 
 
 def stems_dir(songs_dir: str) -> str:
@@ -75,9 +90,9 @@ def _fingerprint(song_path: str) -> dict | None:
 class VocalSeparator:
     """Produces and caches a vocals-removed track for a song.
 
-    Runs separation either inline (blocking the caller) or through a serial
-    background queue, depending on the vocal_separation preference. The queue
-    is serial because a single separation already saturates the CPU.
+    A background worker separates songs one at a time, since one separation
+    already saturates the CPU, in the order they were handed over, except that
+    the song about to play always jumps the line (see prioritize).
     """
 
     def __init__(
@@ -89,19 +104,21 @@ class VocalSeparator:
         self._events = events
         self._preferences = preferences
         self._songs_dir = songs_dir
-        self._queue: Queue = Queue()
+        self._pending: list[str] = []
+        self._wake = Event()
         self._worker: Greenlet | None = None
-        # One separation saturates the machine, and the background worker can
-        # be partway through a song that playback has just come up to.
-        self._lock = threading.Lock()
+        self._current: str | None = None
+        self._process: subprocess.Popen | None = None
+        self._interrupted = False
 
     def start(self) -> None:
         """Start the background separation worker.
 
         A greenlet on the main gevent hub rather than an OS thread, for the same
-        reason the download worker is one: the primitives it touches (Queue,
+        reason the download worker is one: the primitives it touches (Event,
         subprocess) are monkey-patched.
         """
+        self._sweep_partials()
         self._worker = spawn(self._process_queue)
         logging.debug("Vocal separation worker started")
 
@@ -111,20 +128,22 @@ class VocalSeparator:
         mode = self._preferences.get_or_default("vocal_separation")
         return mode if mode in MODES else OFF
 
+    def _path(self, song_path: str, suffix: str) -> str:
+        return os.path.join(
+            stems_dir(self._songs_dir), _cache_key(self._songs_dir, song_path) + suffix
+        )
+
     def cached_track(self, song_path: str) -> str | None:
         """Path to this song's cached vocals-removed track, if one is current.
 
         A cached track whose source has changed size or mtime since it was made
         belongs to a file that is no longer there, so it is reported as a miss.
         """
-        key = _cache_key(self._songs_dir, song_path)
-        track = os.path.join(stems_dir(self._songs_dir), key + _NO_VOCALS_SUFFIX)
+        track = self._path(song_path, _NO_VOCALS_SUFFIX)
         if not os.path.isfile(track):
             return None
-
-        fingerprint_path = os.path.join(stems_dir(self._songs_dir), key + _FINGERPRINT_SUFFIX)
         try:
-            with open(fingerprint_path, encoding="utf-8") as f:
+            with open(self._path(song_path, _FINGERPRINT_SUFFIX), encoding="utf-8") as f:
                 recorded = json.load(f)
         except (OSError, ValueError) as e:
             logging.debug(f"Unreadable stem fingerprint for {song_path}: {e}")
@@ -135,12 +154,29 @@ class VocalSeparator:
             return None
         return track
 
+    def partial_track(self, song_path: str) -> str | None:
+        """The raw track being written right now for this song, if it is the one separating.
+
+        It only ever grows, and stops growing once this returns None for it.
+        """
+        return self._path(song_path, _PARTIAL_SUFFIX) if song_path == self._current else None
+
+    def seconds_ready(self, song_path: str) -> float:
+        """How many seconds of this song's vocals-removed track exist so far."""
+        if self.cached_track(song_path):
+            return float("inf")
+        partial = self.partial_track(song_path)
+        if partial is None:
+            return 0.0
+        try:
+            return os.path.getsize(partial) / PCM_BYTES_PER_SECOND
+        except OSError:
+            return 0.0
+
     def remove_cached(self, song_path: str) -> None:
         """Delete a song's cached track, so deleting a song reclaims its space."""
-        key = _cache_key(self._songs_dir, song_path)
-        directory = stems_dir(self._songs_dir)
-        for suffix in (_NO_VOCALS_SUFFIX, _FINGERPRINT_SUFFIX):
-            path = os.path.join(directory, key + suffix)
+        for suffix in (_NO_VOCALS_SUFFIX, _FINGERPRINT_SUFFIX, _PARTIAL_SUFFIX):
+            path = self._path(song_path, suffix)
             try:
                 os.remove(path)
             except FileNotFoundError:
@@ -149,58 +185,152 @@ class VocalSeparator:
                 logging.warning(f"Could not remove cached stem {path}: {e}")
 
     def queue_separation(self, song_path: str) -> None:
-        """Hand a song to the background worker, unless it is already cached."""
+        """Hand a song to the background worker, unless it is cached or already in line."""
+        if song_path == self._current or song_path in self._pending:
+            return
         if self.cached_track(song_path):
             return
-        self._queue.put(song_path)
+        self._pending.append(song_path)
+        self._wake.set()
 
-    def separate(self, song_path: str) -> str | None:
-        """Separate a song now, blocking until it finishes.
+    def prioritize(self, song_path: str) -> None:
+        """Separate this song next, ahead of the queue and of whatever is separating now.
 
-        Separations run one at a time. A caller arriving while the same song is
-        already being separated waits for it and gets its cached result rather
-        than separating it a second time.
-
-        Returns:
-            Path to the cached vocals-removed track, or None if separation
-            could not be run or did not produce one.
+        For the song about to play: its vocals-off track has to stay ahead of
+        playback, so it can't wait for another song to finish first. A song it
+        interrupts goes back in line right behind it, and starts over.
         """
-        with self._lock:
-            cached = self.cached_track(song_path)
-            if cached:
-                return cached
-            return self._separate_uncached(song_path)
+        if song_path == self._current or self.cached_track(song_path):
+            return
+        if song_path in self._pending:
+            self._pending.remove(song_path)
+        self._pending.insert(0, song_path)
+        if self._current is not None and self._process is not None:
+            logging.info(f"Pausing vocal separation of {self._current} for the song about to play")
+            self._pending.insert(1, self._current)
+            self._interrupted = True
+            self._process.terminate()
+        self._wake.set()
 
-    def _separate_uncached(self, song_path: str) -> str | None:
-        """Separate a song known not to be cached. Caller holds the lock."""
+    def wait_for_head_start(
+        self,
+        song_path: str,
+        seconds: float = PLAYBACK_HEAD_START_SECONDS,
+        timeout: float = HEAD_START_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Block until `seconds` of the song's vocals-removed track exist.
+
+        Returns False if separation fails, or doesn't get there within `timeout`.
+        """
+        self.prioritize(song_path)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.seconds_ready(song_path) >= seconds:
+                return True
+            if song_path != self._current and song_path not in self._pending:
+                return False  # it was separated and nothing was cached: it failed
+            sleep(0.2)
+        logging.warning(f"Vocal separation had no head start after {timeout:.0f}s: {song_path}")
+        return False
+
+    def _process_queue(self) -> None:
+        """Separate queued songs one at a time, forever."""
+        while True:
+            if not self._pending:
+                self._wake.clear()
+                self._wake.wait()
+                continue
+            self._separate_next()
+
+    def _separate_next(self) -> None:
+        """Separate the song at the front of the line, unless it is cached by now."""
+        song_path = self._pending.pop(0)
+        if self.cached_track(song_path):
+            return
+        self._current = song_path
+        try:
+            self._separate(song_path)
+        except Exception as e:
+            # Deliberately broad: one song that cannot be separated must not
+            # take the worker down and strand every song queued behind it.
+            logging.error(f"Error separating {song_path}: {e}")
+        finally:
+            # Cleared only now, after the track is cached, so a reader of the
+            # partial track never sees it stop growing before it's finished.
+            self._current = None
+            self._process = None
+            self._interrupted = False
+            self._sweep_partials()
+
+    def _separate(self, song_path: str) -> None:
+        """Separate one song, writing its partial track as it goes, then cache it."""
         # Recorded before separation: a song replaced while it was separating
         # would otherwise be fingerprinted as the source of a track made from
         # the file it replaced.
         fingerprint = _fingerprint(song_path)
         if fingerprint is None:
-            return None
+            return
+        partial = self._path(song_path, _PARTIAL_SUFFIX)
+        os.makedirs(stems_dir(self._songs_dir), exist_ok=True)
+
+        cmd = [sys.executable, "-m", "pikaraoke.lib.mdx", song_path, partial]
+        cmd += ["--model-dir", os.path.join(get_data_directory(), "models")]
+        logging.info(f"Separating vocals: {song_path}")
+        try:
+            self._process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+        except OSError as e:
+            logging.error(f"Could not start the vocal separator: {e}")
+            return
+        use_spare_capacity(self._process)
+        self._events.emit("vocals_separating", song_path)
+
+        output, _unused = self._process.communicate()
+        if self._interrupted:
+            return
+        if self._process.returncode != 0:
+            logging.error(
+                f"Vocal separation failed for {song_path} "
+                f"(exit {self._process.returncode}): {output}"
+            )
+            return
 
         with tempfile.TemporaryDirectory(prefix="pikaraoke-separation-") as work_dir:
-            pcm = os.path.join(work_dir, "no_vocals.pcm")
-            if not _run_mdx(song_path, pcm):
-                return None
             encoded = os.path.join(work_dir, "no_vocals.mp3")
-            if not _encode_mp3(pcm, encoded):
-                return None
-            return self._store(song_path, encoded, fingerprint)
+            if _encode_mp3(partial, encoded):
+                self._store(song_path, encoded, fingerprint)
+
+    def _sweep_partials(self) -> None:
+        """Delete partial tracks no longer being written.
+
+        Those are finished separations, cached by now, and interrupted ones,
+        which start over. One a player still has open can't be deleted on
+        Windows, so it is left for the next sweep.
+        """
+        directory = stems_dir(self._songs_dir)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        writing = self.partial_track(self._current) if self._current else None
+        for name in names:
+            path = os.path.join(directory, name)
+            if name.endswith(_PARTIAL_SUFFIX) and path != writing:
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    logging.debug(f"Partial track still in use, leaving it for later: {e}")
 
     def _store(self, song_path: str, produced: str, fingerprint: dict) -> str | None:
         """Move a finished track into the cache and record what it was made from."""
         directory = stems_dir(self._songs_dir)
-        key = _cache_key(self._songs_dir, song_path)
-        track = os.path.join(directory, key + _NO_VOCALS_SUFFIX)
+        track = self._path(song_path, _NO_VOCALS_SUFFIX)
         try:
             os.makedirs(directory, exist_ok=True)
             # Across filesystems when the temp dir and the library differ.
             shutil.move(produced, track)
-            with open(
-                os.path.join(directory, key + _FINGERPRINT_SUFFIX), "w", encoding="utf-8"
-            ) as f:
+            with open(self._path(song_path, _FINGERPRINT_SUFFIX), "w", encoding="utf-8") as f:
                 json.dump(fingerprint, f)
         except OSError as e:
             logging.error(f"Could not cache separated track for {song_path}: {e}")
@@ -210,40 +340,6 @@ class VocalSeparator:
         self._events.emit("vocals_separated", song_path, track)
         return track
 
-    def _process_queue(self) -> None:
-        """Serially separate queued songs, forever."""
-        while True:
-            song_path = self._queue.get()
-            try:
-                self.separate(song_path)
-            except Exception as e:
-                # Deliberately broad: one song that cannot be separated must not
-                # take the worker down and strand every song queued behind it.
-                logging.error(f"Error separating {song_path}: {e}")
-            finally:
-                self._queue.task_done()
-
-
-def _run_mdx(song_path: str, pcm_path: str) -> bool:
-    """Run the MDX separator over one song in its own process. True on a clean exit."""
-    cmd = [sys.executable, "-m", "pikaraoke.lib.mdx", song_path, pcm_path]
-    cmd += ["--model-dir", os.path.join(get_data_directory(), "models")]
-    logging.info(f"Separating vocals: {song_path}")
-    try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except OSError as e:
-        logging.error(f"Could not start the vocal separator: {e}")
-        return False
-
-    use_spare_capacity(process)
-    output, _unused = process.communicate()
-    if process.returncode != 0:
-        logging.error(
-            f"Vocal separation failed for {song_path} (exit {process.returncode}): {output}"
-        )
-        return False
-    return True
-
 
 def _encode_mp3(pcm_path: str, mp3_path: str) -> bool:
     """Encode the separator's raw PCM to mp3 with ffmpeg.
@@ -252,7 +348,8 @@ def _encode_mp3(pcm_path: str, mp3_path: str) -> bool:
     again when decoding, so the track stays sample-aligned with the original.
     An encoder that skips that header leaves the track about 25ms late.
     """
-    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", "44100", "-ac", "2"]
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", PCM_FORMAT, "-ar", str(PCM_SAMPLE_RATE)]
+    cmd += ["-ac", str(PCM_CHANNELS)]
     cmd += ["-i", pcm_path, "-c:a", "libmp3lame", "-b:a", MP3_BITRATE, mp3_path]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)

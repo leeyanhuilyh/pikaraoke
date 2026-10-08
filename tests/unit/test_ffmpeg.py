@@ -315,3 +315,26 @@ class TestAudioOnlyAlternateSource:
         ).get_args()
 
         assert "rubberband=pitch=1.189" in args[args.index("-filter_complex") + 1]
+
+
+class TestAudioOnlyFromStdin:
+    """A vocals-off rendition reading a track that is still being separated."""
+
+    def _args(self, **kwargs):
+        return build_audio_only_ffmpeg_cmd(
+            _make_fr(), 0, "/tmp/out.m3u8", "/tmp/out_%03d.m4s", "out_init.mp4", **kwargs
+        ).get_args()
+
+    def test_reads_raw_pcm_from_stdin(self):
+        args = self._args(audio_from_stdin=True)
+
+        i = args.index("-i")
+        assert args[i + 1] == "pipe:"
+        assert args[args.index("-f") + 1] == "s16le"
+        assert "/songs/track.mp4" not in args
+
+    def test_never_prints_progress_nobody_reads(self):
+        """A long-running rendition's progress line would fill its unread pipe and freeze it."""
+        args = self._args()
+        assert "-nostats" in args
+        assert args[args.index("-loglevel") + 1] == "error"

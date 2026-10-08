@@ -5,7 +5,7 @@ off the web server's event loop and can be given a lower CPU priority. Needs
 numpy and onnxruntime from the optional vocal-separation dependency group,
 which is why the app never imports this module, only runs it.
 
-The output is raw 16-bit stereo PCM at 44.1kHz, appended one model chunk at a
+The output is raw PCM in ffmpeg.PCM_FORMAT, appended one model chunk at a
 time, so a reader can follow it while it is still being written.
 """
 
@@ -19,9 +19,10 @@ import urllib.request
 import numpy as np
 import onnxruntime as ort
 
-SAMPLE_RATE = 44100
-CHANNELS = 2
-BYTES_PER_SECOND = SAMPLE_RATE * CHANNELS * 2  # 16-bit samples
+from pikaraoke.lib.ffmpeg import PCM_CHANNELS, PCM_SAMPLE_RATE
+
+SAMPLE_RATE = PCM_SAMPLE_RATE
+CHANNELS = PCM_CHANNELS
 
 MODEL_NAME = "UVR_MDXNET_9482"
 MODEL_URL = (
@@ -79,9 +80,7 @@ class MDX:
         # reserved, nearly doubling peak RAM for no speed gain.
         options.enable_cpu_mem_arena = False
         options.enable_mem_pattern = False
-        self.session = ort.InferenceSession(
-            model_path, options, providers=["CPUExecutionProvider"]
-        )
+        self.session = ort.InferenceSession(model_path, options, providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
 
     def _spectrogram(self, wave: np.ndarray) -> np.ndarray:

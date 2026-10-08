@@ -16,7 +16,7 @@ import os
 import subprocess
 import time
 from threading import Event, Lock, Thread
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, BinaryIO, NamedTuple
 
 from pikaraoke.lib.ffmpeg import (
     HLS_SEGMENT_SECONDS,
@@ -206,18 +206,70 @@ class RenditionManager:
             return Rendition(semitones, vocals_on) in self._declared
 
     def no_vocals_available(self) -> bool:
-        """Whether the current song has a separated vocals-removed track to switch to."""
-        return self._no_vocals_track() is not None
+        """Whether the current song has a vocals-removed track yet, even a partial one."""
+        return self._no_vocals_source() is not None
 
-    def _no_vocals_track(self) -> str | None:
-        """The current song's cached vocals-removed track, if it has one yet.
+    def _no_vocals_source(self) -> tuple[str, bool] | None:
+        """The current song's vocals-removed audio, as (path, still being written).
 
-        Looked up each time rather than once at start: in background mode the
-        track can finish separating while the song is already playing.
+        Looked up each time rather than once at start: separation runs alongside
+        playback, so a track can appear, and later finish, mid-song.
         """
         if self._vocal_separator is None or self._source_path is None:
             return None
-        return self._vocal_separator.cached_track(self._source_path)
+        cached = self._vocal_separator.cached_track(self._source_path)
+        if cached:
+            return cached, False
+        partial = self._vocal_separator.partial_track(self._source_path)
+        return (partial, True) if partial else None
+
+    def _open_no_vocals(self) -> tuple[str | None, BinaryIO | None]:
+        """What a vocals-removed rendition renders from: a finished file's path, or
+        the partial track's path with a handle open on it. (None, None) if neither."""
+        for _attempt in range(2):
+            source = self._no_vocals_source()
+            if source is None:
+                return None, None
+            path, growing = source
+            if not growing:
+                return path, None
+            try:
+                return path, open(path, "rb")  # pylint: disable=consider-using-with
+            except FileNotFoundError:
+                # Separation finished and its partial track was swept between the
+                # lookup and here: look again, and the cached track turns up.
+                continue
+        return None, None
+
+    def _follow(self, partial: BinaryIO, path: str, proc: subprocess.Popen) -> None:
+        """Feed a rendition the partial track as separation writes it, to the end.
+
+        ffmpeg would take reaching the end of a file still being written for the
+        end of the song, so it reads a pipe kept topped up from the file instead.
+        """
+        try:
+            with partial:
+                while not self._stop_event.is_set():
+                    data = partial.read(1 << 16)
+                    if data:
+                        proc.stdin.write(data)
+                        continue
+                    if self._vocal_separator.partial_track(self._source_path) == path:
+                        time.sleep(0.1)
+                        continue
+                    # Separation has finished, so whatever was written after the
+                    # last read is all there is: hand it over and stop.
+                    while data := partial.read(1 << 16):
+                        proc.stdin.write(data)
+                    break
+        except (OSError, ValueError) as e:
+            # The rendition was killed under us, e.g. the song ended.
+            logging.debug(f"Stopped following the vocals-removed track: {e}")
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
 
     def prioritize(self, rendition: Rendition) -> None:
         """Move a queued rendition to the front so it renders next."""
@@ -316,7 +368,7 @@ class RenditionManager:
         if self._vocal_separator is not None and self._vocal_separator.mode != OFF:
             modes.append(False)
         declared = [Rendition(s, v) for v in modes for s in pitches]
-        prerender_modes = [True] + ([False] if self._no_vocals_track() else [])
+        prerender_modes = [True] + ([False] if self._no_vocals_source() else [])
         prerendered = [
             Rendition(s, v)
             for v in prerender_modes
@@ -384,17 +436,19 @@ class RenditionManager:
 
         Safe to call from both the background queue and an on-demand
         switch, which can race for the same rendition. Returns None for a
-        vocals-removed rendition whose track hasn't been separated yet.
+        vocals-removed rendition whose track hasn't started separating yet.
         """
-        audio_source = None
+        audio_source, partial = None, None
         if not rendition.vocals_on:
-            audio_source = self._no_vocals_track()
+            audio_source, partial = self._open_no_vocals()
             if audio_source is None:
                 return None
 
         with self._lock:
             existing = self._audio_processes.get(rendition)
             if rendition in self._rendering and existing is not None:
+                if partial is not None:
+                    partial.close()
                 return existing
             self._rendering.add(rendition)
             if rendition in self._pending:
@@ -411,11 +465,14 @@ class RenditionManager:
             f"{fr.stream_uid}_audio_{label}_init.mp4",
             normalize_audio,
             avsync,
-            audio_source,
+            None if partial else audio_source,
+            audio_from_stdin=partial is not None,
         )
         proc = cmd.run_async(pipe_stderr=True, pipe_stdin=True)
         with self._lock:
             self._audio_processes[rendition] = proc
+        if partial is not None:
+            Thread(target=self._follow, args=(partial, audio_source, proc), daemon=True).start()
         return proc
 
     def _render_one(self, fr: "FileResolver", rendition: Rendition) -> bool:

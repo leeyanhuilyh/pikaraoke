@@ -24,6 +24,7 @@ import psutil
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pikaraoke.lib import mdx  # pylint: disable=wrong-import-position
+from pikaraoke.lib.ffmpeg import PCM_FORMAT  # pylint: disable=wrong-import-position
 from pikaraoke.lib.get_platform import (  # pylint: disable=wrong-import-position
     get_data_directory,
 )
@@ -57,7 +58,7 @@ def section(path: str, seconds: float) -> tuple[float, float]:
 
 
 def save_wav(path: str, audio: np.ndarray) -> None:
-    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", str(mdx.SAMPLE_RATE)]
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", PCM_FORMAT, "-ar", str(mdx.SAMPLE_RATE)]
     cmd += ["-ac", str(mdx.CHANNELS), "-i", "-", path]
     subprocess.run(cmd, input=mdx.to_pcm16(audio), check=True)
 

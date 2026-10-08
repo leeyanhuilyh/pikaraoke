@@ -32,51 +32,50 @@ class TestSeparateQueuedSong:
         karaoke.vocal_separator.queue_separation.assert_not_called()
 
 
-class TestSeparateBeforePlay:
-    def test_blocks_on_separation_and_shows_the_title(self, karaoke):
+class TestPrepareVocals:
+    def test_does_nothing_when_off(self, karaoke):
+        karaoke.vocal_separator.mode = "off"
+        Karaoke.prepare_vocals(karaoke, SONG)
+        karaoke.vocal_separator.prioritize.assert_not_called()
+
+    def test_does_nothing_for_a_song_already_separated(self, karaoke):
+        karaoke.vocal_separator.mode = "before_play"
+        karaoke.vocal_separator.cached_track.return_value = "/songs/.stems/x.no_vocals.mp3"
+        Karaoke.prepare_vocals(karaoke, SONG)
+        karaoke.vocal_separator.prioritize.assert_not_called()
+        karaoke.vocal_separator.wait_for_head_start.assert_not_called()
+
+    def test_background_mode_puts_the_song_first_but_does_not_wait(self, karaoke):
+        """Its vocals-off track has to keep ahead of playback, so no other song goes first."""
+        karaoke.vocal_separator.mode = "background"
+        Karaoke.prepare_vocals(karaoke, SONG)
+        karaoke.vocal_separator.prioritize.assert_called_once_with(SONG)
+        karaoke.vocal_separator.wait_for_head_start.assert_not_called()
+
+    def test_before_play_waits_for_a_head_start_and_shows_why(self, karaoke):
         karaoke.vocal_separator.mode = "before_play"
         shown = []
+        karaoke.vocal_separator.wait_for_head_start.side_effect = lambda path: shown.append(
+            karaoke.separating_title
+        )
 
-        def capture(path):
-            shown.append(karaoke.separating_title)
+        Karaoke.prepare_vocals(karaoke, SONG)
 
-        karaoke.vocal_separator.separate.side_effect = capture
-        Karaoke.separate_before_play(karaoke, SONG)
-
+        karaoke.vocal_separator.prioritize.assert_called_once_with(SONG)
         assert shown == ["Artist - Song"]
-        karaoke.vocal_separator.separate.assert_called_once_with(SONG)
-
-    def test_clears_the_title_and_tells_the_splash_when_done(self, karaoke):
-        karaoke.vocal_separator.mode = "before_play"
-        Karaoke.separate_before_play(karaoke, SONG)
-
         assert karaoke.separating_title is None
         # Once to show the message, once to take it down.
         assert karaoke.update_now_playing_socket.call_count == 2
 
-    def test_clears_the_title_even_if_separation_raises(self, karaoke):
+    def test_clears_the_message_even_if_waiting_fails(self, karaoke):
         """A stuck message on the splash screen would outlive the failed song."""
         karaoke.vocal_separator.mode = "before_play"
-        karaoke.vocal_separator.separate.side_effect = RuntimeError("boom")
+        karaoke.vocal_separator.wait_for_head_start.side_effect = RuntimeError("boom")
 
         with pytest.raises(RuntimeError):
-            Karaoke.separate_before_play(karaoke, SONG)
+            Karaoke.prepare_vocals(karaoke, SONG)
 
         assert karaoke.separating_title is None
-
-    def test_skips_a_song_that_is_already_separated(self, karaoke):
-        karaoke.vocal_separator.mode = "before_play"
-        karaoke.vocal_separator.cached_track.return_value = "/songs/.stems/x.no_vocals.mp3"
-        Karaoke.separate_before_play(karaoke, SONG)
-
-        karaoke.vocal_separator.separate.assert_not_called()
-        karaoke.update_now_playing_socket.assert_not_called()
-
-    @pytest.mark.parametrize("mode", ["off", "background"])
-    def test_only_before_play_mode_holds_playback(self, karaoke, mode):
-        karaoke.vocal_separator.mode = mode
-        Karaoke.separate_before_play(karaoke, SONG)
-        karaoke.vocal_separator.separate.assert_not_called()
 
 
 class TestSetVocals:
@@ -110,10 +109,13 @@ class TestSetVocals:
         karaoke.playback_controller.prepare_switch.assert_not_called()
         karaoke.events.emit.assert_not_called()
 
-    def test_switches_even_if_the_rendition_is_not_fully_buffered(self, karaoke):
-        """The player follows the growing playlist, so a timeout is not a reason to refuse."""
+    def test_refuses_while_the_vocals_off_track_is_still_catching_up(self, karaoke):
+        """Separation can still be behind the playhead early in a song; switching to a
+        track with nothing there yet would stall the player."""
         karaoke.playback_controller.prepare_switch.return_value = False
+        karaoke.playback_controller.now_playing_vocals = True
 
-        assert Karaoke.set_vocals(karaoke, False) is True
+        assert Karaoke.set_vocals(karaoke, False) is False
 
-        assert karaoke.playback_controller.now_playing_vocals is False
+        assert karaoke.playback_controller.now_playing_vocals is True
+        karaoke.events.emit.assert_not_called()

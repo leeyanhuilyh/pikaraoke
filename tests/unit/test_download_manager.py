@@ -862,30 +862,17 @@ class TestVocalSeparationHandoff:
     def test_off_never_separates(self, manager, song_manager, separator):
         self.run_download(manager, song_manager, "off", separator)
         separator.queue_separation.assert_not_called()
-        separator.separate.assert_not_called()
 
     def test_background_queues_without_blocking_the_download(
         self, manager, song_manager, separator
     ):
         self.run_download(manager, song_manager, "background", separator)
         separator.queue_separation.assert_called_once_with("/songs/Song---dQw4w9WgXcQ.mp4")
-        separator.separate.assert_not_called()
 
-    def test_before_play_separates_inline(self, manager, song_manager, separator):
+    def test_before_play_never_blocks_the_download(self, manager, song_manager, separator):
+        """Playback waits for a head start when the song comes up, not the download."""
         self.run_download(manager, song_manager, "before_play", separator)
-        separator.separate.assert_called_once_with("/songs/Song---dQw4w9WgXcQ.mp4")
-        separator.queue_separation.assert_not_called()
-
-    def test_before_play_separates_ahead_of_the_playback_queue(
-        self, manager, song_manager, queue_manager, separator
-    ):
-        """The point of the mode: vocals-off must exist before the song can play."""
-        order = []
-        separator.mode = "before_play"
-        separator.separate.side_effect = lambda path: order.append("separate")
-        queue_manager.enqueue.side_effect = lambda *a, **kw: order.append("enqueue")
-        self.run_download(manager, song_manager, "before_play", separator)
-        assert order == ["separate", "enqueue"]
+        separator.queue_separation.assert_called_once_with("/songs/Song---dQw4w9WgXcQ.mp4")
 
     def test_a_download_without_a_separator_still_completes(
         self, download_manager, song_manager, queue_manager
