@@ -1,23 +1,24 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["numpy", "onnxruntime"]
+# dependencies = ["numpy", "onnxruntime", "psutil"]
 # ///
 """Benchmark UVR MDX-Net vocal removal on this machine, without PyTorch.
 
 Measures whether a lighter model than Demucs can separate a song fast enough on
-a Raspberry Pi: time per second of audio, and peak memory. The model and its
-settings are downloaded on first use. Runs in its own environment, so the
-project's dependencies are untouched.
+a given machine: time per second of audio, and peak memory. By default it takes
+a minute from the middle of the song, since intros are often instrumental, and
+saves that section both as-is and with the vocals removed, for listening. The
+model and its settings are downloaded on first use. Runs in its own
+environment, so the project's dependencies are untouched.
 
 Usage:
-    uv run scripts/bench_vocal_removal.py INPUT [--model NAME] [--threads N] [--out FILE]
+    uv run scripts/bench_vocal_removal.py SONG [--seconds N] [--model NAME] [--threads N]
 """
 
 import argparse
 import hashlib
 import json
 import os
-import resource
 import subprocess
 import sys
 import time
@@ -27,6 +28,7 @@ import numpy as np
 
 # Installed from the inline script metadata above, not the project, so pylint can't see it.
 import onnxruntime as ort  # pylint: disable=import-error
+import psutil
 
 SR = 44100
 HOP = 1024
@@ -120,79 +122,93 @@ class MDX:
             )
 
 
+def peak_memory_mb() -> float:
+    """Peak memory of this process so far: peak RSS on Linux/macOS, peak working set on Windows."""
+    try:
+        import resource  # pylint: disable=import-outside-toplevel
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is in KB on Linux but bytes on macOS.
+        return peak / 1024 / (1024 if sys.platform == "darwin" else 1)
+    except ImportError:
+        return psutil.Process().memory_info().peak_wset / 1024 / 1024
+
+
+def section(path: str, seconds: float) -> tuple[float, float]:
+    """Start and length of the section to separate: `seconds` from the middle, or all of it."""
+    duration = float(
+        subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    if seconds <= 0 or seconds >= duration:
+        return 0.0, duration
+    return (duration - seconds) / 2, seconds
+
+
+def decode(path: str, start: float, length: float) -> np.ndarray:
+    """Decode a section of any audio or video file to stereo float32 at 44.1kHz, shaped (2, N)."""
+    cmd = ["ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", path]
+    cmd += ["-vn", "-ac", "2", "-ar", str(SR), "-f", "f32le", "-"]
+    raw = subprocess.run(cmd, capture_output=True, check=True).stdout
+    return np.frombuffer(raw, np.float32).reshape(-1, 2).T.copy()
+
+
+def encoder(path: str) -> subprocess.Popen:
+    """An ffmpeg process that writes raw stereo float32 from its stdin to `path`."""
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(SR), "-ac", "2", "-i", "-"]
+    return subprocess.Popen(cmd + [path], stdin=subprocess.PIPE)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n", maxsplit=1)[0])
     parser.add_argument("input", help="song or clip (any format ffmpeg reads)")
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=60,
+        help="length taken from the middle; 0 for the whole song",
+    )
     parser.add_argument("--model", default="UVR_MDXNET_9482", help="UVR MDX-Net model name")
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--out", help="write the vocals-removed audio here (wav/flac/mp3)")
+    parser.add_argument("--out-dir", default=".", help="where the two output files are written")
     args = parser.parse_args()
 
     model = fetch(f"{MODELS_URL}/{args.model}.onnx", os.path.join(CACHE, f"{args.model}.onnx"))
-    decoded = subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-i",
-            args.input,
-            "-vn",
-            "-ac",
-            "2",
-            "-ar",
-            str(SR),
-            "-f",
-            "f32le",
-            "-",
-        ],
-        capture_output=True,
-        check=True,
-    ).stdout
-    mix = np.frombuffer(decoded, np.float32).reshape(-1, 2).T.copy()
-    del decoded
+    start, length = section(args.input, args.seconds)
+    mix = decode(args.input, start, length)
     seconds = mix.shape[1] / SR
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(args.input))[0]
+    original_path = os.path.join(args.out_dir, f"{stem}.original.wav")
+    removed_path = os.path.join(args.out_dir, f"{stem}.{args.model}.wav")
+    original = encoder(original_path)
+    original.communicate(np.ascontiguousarray(mix.T).tobytes())
 
     started = time.monotonic()
     separator = MDX(model, args.threads)
     loaded = time.monotonic()
-    writer = None
-    if args.out:
-        writer = subprocess.Popen(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-y",
-                "-f",
-                "f32le",
-                "-ar",
-                str(SR),
-                "-ac",
-                "2",
-                "-i",
-                "-",
-                args.out,
-            ],
-            stdin=subprocess.PIPE,
-        )
+    removed = encoder(removed_path)
     for part in separator.instrumental(mix):
-        if writer:
-            writer.stdin.write(np.ascontiguousarray(part.T, dtype=np.float32).tobytes())
-    if writer:
-        writer.stdin.close()
-        writer.wait()
+        removed.stdin.write(np.ascontiguousarray(part.T, dtype=np.float32).tobytes())
+    removed.stdin.close()
+    removed.wait()
     finished = time.monotonic()
 
     work = finished - loaded
-    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    minutes_per_song = (loaded - started + work / seconds * 270) / 60
     print(f"model:            {args.model} ({args.threads} threads)")
-    print(f"audio:            {seconds:.0f}s")
+    print(f"section:          {seconds:.0f}s starting at {int(start // 60)}:{start % 60:04.1f}")
     print(f"model load:       {loaded - started:.1f}s")
     print(f"separation:       {work:.1f}s  ({work / seconds:.2f}s per second of audio)")
-    print(
-        f"4.5-minute song:  ~{(loaded - started + work / seconds * 270) / 60:.1f} minutes (estimated)"
-    )
-    print(f"peak memory:      {peak_mb:.0f} MB")
+    print(f"4.5-minute song:  ~{minutes_per_song:.1f} minutes (estimated)")
+    print(f"peak memory:      {peak_memory_mb():.0f} MB")
+    print(f"saved:            {original_path}")
+    print(f"                  {removed_path}")
 
 
 if __name__ == "__main__":
