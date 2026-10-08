@@ -27,10 +27,22 @@ dependencies = [
   "sounddevice>=0.5.0; sys_platform != 'linux'",
 ]
 
-# The vendored fork, not PyPI's demucs. Resolves torch by platform on its own:
-# the CUDA build on x86_64 Linux/Windows, CPU/MPS wheels on aarch64 (Pi) and macOS.
+# The vendored fork, not PyPI's demucs.
 [tool.uv.sources]
 demucs = { path = "vendor/demucs", editable = true }
+# PyPI's ARM Linux torch is a CUDA build for NVIDIA's ARM servers, and pulls
+# several GB of NVIDIA libraries a Raspberry Pi can never use. The CPU-only
+# build from PyTorch's own index has none. Everywhere else keeps PyPI's torch:
+# the CUDA build on x86_64 Linux and Windows, MPS on Apple Silicon.
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+# Only torch is taken from here; every other package still comes from PyPI.
+explicit = true
 
 [tool.uv]
 # A default group rather than a project dependency: `uv run` installs it, so
@@ -61,6 +73,8 @@ dev = [
 ]
 vocal-separation = [
     "demucs",
+    # Listed directly, though demucs already requires it, so the source above applies.
+    "torch",
 ]
 translations = [
     "deep-translator>=1.11.4",
